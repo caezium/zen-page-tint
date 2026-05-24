@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Zen Page Tint
 // @description    Adaptive Zen chrome color from the active page
-// @version        1.0.0
+// @version        1.0.1
 // ==/UserScript==
 
 (() => {
@@ -184,20 +184,49 @@
   }
 
   // Coalesce rapid back-to-back schedule calls (TabSelect followed immediately by
-  // onLocationChange, two onLocationChanges from a redirect, etc.) into a single rAF.
-  // If any caller asked for forceFresh, the coalesced run honors it.
+  // onLocationChange, two onLocationChanges from a redirect, etc.) into a single
+  // run. If any caller asked for forceFresh, the coalesced run honors it.
+  //
+  // Reliability: we race requestAnimationFrame (preferred — yields to next paint)
+  // against a setTimeout safety net. Whichever fires first wins; the other is
+  // canceled. This matters because rAF in chrome scope can be throttled or
+  // suppressed when the chrome window is occluded, minimized, or otherwise
+  // rendering-idle — without the setTimeout fallback the `scheduled` flag would
+  // stick true and all future tab-switch updates would be dropped.
+  //
+  // Belt-and-suspenders: a self-heal check resets the flag if it's been stuck for
+  // longer than the safety-net interval, so even if both timers somehow fail to
+  // fire the next scheduleSample call recovers.
+  const SCHEDULE_SAFETY_MS = 100;
   let scheduled = false;
   let scheduledForce = false;
+  let scheduledAt = 0;
+  let scheduleRafId = 0;
+  let scheduleTimerId = 0;
   function scheduleSample(forceFresh = false) {
     if (forceFresh) scheduledForce = true;
+    // Self-heal: if the flag has been stuck longer than the safety-net interval,
+    // assume both timers somehow missed and reset so we can re-schedule.
+    if (scheduled && Date.now() - scheduledAt > SCHEDULE_SAFETY_MS * 4) {
+      log('schedule flag stuck — self-healing');
+      scheduled = false;
+    }
     if (scheduled) return;
     scheduled = true;
-    requestAnimationFrame(() => {
-      const force = scheduledForce;
+    scheduledAt = Date.now();
+    const run = () => {
+      if (!scheduled) return; // already ran via the other path
       scheduled = false;
+      try { if (scheduleRafId) cancelAnimationFrame(scheduleRafId); } catch {}
+      try { if (scheduleTimerId) clearTimeout(scheduleTimerId); } catch {}
+      scheduleRafId = 0;
+      scheduleTimerId = 0;
+      const force = scheduledForce;
       scheduledForce = false;
       sampleAndApply(gBrowser.selectedBrowser, force);
-    });
+    };
+    scheduleRafId = requestAnimationFrame(run);
+    scheduleTimerId = setTimeout(run, SCHEDULE_SAFETY_MS);
   }
 
   // TabSelect: user switched tabs. Cache hit fast path; else sample.
