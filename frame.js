@@ -297,6 +297,26 @@
       observer.observe(doc.documentElement, opts);
       observer.observe(doc.body, opts);
       content.__zen_page_tint_observer = observer;
+
+      // Observe <head> for theme-affecting mutations that don't surface as
+      // attribute changes on html/body. Covers:
+      //   - Zen Boosts injecting a per-site <style> element and live-editing
+      //     its textContent as the user drags the color picker.
+      //   - Sites swapping <link rel="stylesheet"> hrefs for theme switching.
+      //   - Dynamic <meta name="theme-color"> content updates.
+      //   - Dev-tool / hot-reload stylesheet swaps.
+      // Head churn is minimal on most sites; debouncedSample coalesces bursts.
+      if (doc.head) {
+        const headObserver = new content.MutationObserver(debouncedSample);
+        headObserver.observe(doc.head, {
+          childList: true,        // new <style>/<link>/<meta> nodes
+          subtree: true,          // attr + characterData changes on children
+          characterData: true,    // textContent changes inside <style> (live editing)
+          attributes: true,
+          attributeFilter: ['href', 'content', 'media', 'disabled'],
+        });
+        content.__zen_page_tint_head_observer = headObserver;
+      }
     }
     startObserving();
 

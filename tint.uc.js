@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Zen Page Tint
 // @description    Adaptive Zen chrome color from the active page
-// @version        1.0.1
+// @version        1.0.2
 // ==/UserScript==
 
 (() => {
