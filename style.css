@@ -222,12 +222,17 @@
       opacity: 1 !important;
     }
 
-    /* Per-tab text color: NO transition (caused multi-thousand-element paint lag) */
+    /* Per-tab text color: NO transition (caused multi-thousand-element paint lag).
+       `color` for text labels, `fill` for SVG favicons — `color` on an <image> element
+       does nothing visible, so it's split out. Raster favicons remain unaffected. */
     .tabbrowser-tab,
     .tabbrowser-tab .tab-content,
-    .tabbrowser-tab .tab-label,
-    .tabbrowser-tab .tab-icon-image {
+    .tabbrowser-tab .tab-label {
       color: var(--zen-tab-header-foreground, inherit) !important;
+    }
+
+    .tabbrowser-tab .tab-icon-image {
+      fill: var(--zen-tab-header-foreground, currentColor) !important;
     }
   }
 }
