@@ -1,0 +1,233 @@
+/*
+ * Zen Page Tint — CSS
+ *
+ * Design choices:
+ *  - No transitions on .tabbrowser-tab elements (paint lag with many tabs)
+ *  - Optional edge-to-edge frame (controlled by --zpt-frame-gap variable below)
+ *  - Only paints URL bar wrapper, sidebar, titlebar — not every tab label individually
+ *
+ * Tune knobs at :root for gap/radius/shadow.
+ */
+
+:root {
+  --zpt-frame-gap: 5px;
+  --zpt-frame-radius: 14px;
+  --zpt-frame-shadow: 0 4px 16px rgba(0, 0, 0, 0.12), 0 1px 4px rgba(0, 0, 0, 0.10);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --zpt-frame-shadow: 0 6px 18px rgba(0, 0, 0, 0.34), 0 1px 5px rgba(0, 0, 0, 0.30);
+  }
+}
+
+/* ---------- URL bar / appcontent wrapper ---------- */
+
+:root:not([zen-single-toolbar="true"]) {
+  #zen-appcontent-wrapper {
+    z-index: 3;
+    margin: var(--zpt-frame-gap) var(--zpt-frame-gap) var(--zpt-frame-gap) 0 !important;
+    box-shadow: var(--zpt-frame-shadow);
+    border-radius: var(--zpt-frame-radius);
+    overflow: hidden;
+    isolation: isolate;
+  }
+
+  @media -moz-pref("zen.tabs.vertical.right-side") {
+    #zen-appcontent-wrapper {
+      margin: var(--zpt-frame-gap) 0 var(--zpt-frame-gap) var(--zpt-frame-gap) !important;
+    }
+  }
+
+  &:has([zen-compact-mode="true"]) #zen-appcontent-wrapper {
+    margin: var(--zpt-frame-gap) !important;
+  }
+
+  &[chromehidden~="toolbar"],
+  &:has(#navigator-toolbox[tabs-hidden]) {
+    #zen-appcontent-wrapper {
+      margin: 0 !important;
+      border-radius: 0 0 var(--zpt-frame-radius) var(--zpt-frame-radius) !important;
+    }
+  }
+
+  #tabbrowser-tabpanels,
+  #tabbrowser-tabbox {
+    overflow: hidden;
+  }
+
+  /* URL bar background tints to page color */
+  #zen-appcontent-navbar-wrapper {
+    background-color: var(--zen-tab-header-background, var(--zen-main-browser-background-toolbar));
+    box-shadow: none;
+    color: var(--zen-tab-header-foreground, inherit);
+    fill: currentColor;
+    --toolbox-textcolor: currentColor;
+    --toolbarbutton-icon-fill: currentColor;
+    --toolbar-color: currentColor;
+    --toolbar-field-color: currentColor;
+    --input-color: var(--zen-tab-header-foreground, currentColor);
+    transition: background-color 100ms linear;
+  }
+
+  /* URL input text — explicitly follow the foreground so the URL is readable
+     when the page bg is very light (black text on white) or very dark (white on dark).
+     Without this, Zen's defaults stay gray and the URL goes nearly invisible. */
+  #urlbar:not([zen-floating-urlbar="true"]),
+  #urlbar:not([zen-floating-urlbar="true"]) .urlbar-input-box,
+  #urlbar:not([zen-floating-urlbar="true"]) #urlbar-input {
+    color: var(--zen-tab-header-foreground, inherit) !important;
+    --toolbar-field-color: var(--zen-tab-header-foreground, currentColor);
+    --input-color: var(--zen-tab-header-foreground, currentColor);
+  }
+
+  /* Broader chrome elements that should follow --zen-tab-header-foreground.
+     CSS rules are cheap at runtime even if many — only matching elements paint. Covers:
+       - Toolbar buttons (nav buttons, panel, extensions)
+       - Bookmark toolbar items
+       - URL bar identity / page-action icons
+       - Titlebar window controls
+       - Personal toolbar */
+  #zen-appcontent-navbar-wrapper :is(
+    #nav-bar-customization-target > :not(#urlbar-container):not(#urlbar[zen-floating-urlbar="true"]),
+    #nav-bar-customization-target > :not(#urlbar-container):not(#urlbar[zen-floating-urlbar="true"]) :is(toolbarbutton, .toolbarbutton-1, .toolbarbutton-icon, .toolbarbutton-text, .urlbar-icon),
+    #urlbar:not([zen-floating-urlbar="true"]) #urlbar-input-container :is(.urlbar-page-action, .identity-box-button, .urlbar-icon),
+    #urlbar:not([zen-floating-urlbar="true"]) #urlbar-input-container :is(.urlbar-page-action, .identity-box-button) :is(.toolbarbutton-icon, .urlbar-icon),
+    #personal-bookmarks,
+    #PersonalToolbar :is(#personal-bookmarks, .browser-toolbar),
+    #PersonalToolbar :is(toolbarbutton, .toolbarbutton-1, .toolbarbutton-icon, .toolbarbutton-text, .bookmark-item),
+    #PanelUI-button,
+    #PanelUI-button :is(toolbarbutton, .toolbarbutton-1, .toolbarbutton-icon),
+    .titlebar-buttonbox-container :is(toolbarbutton, .toolbarbutton-1, .toolbarbutton-icon, .titlebar-button),
+    .titlebar-buttonbox-container :is(toolbarbutton, .toolbarbutton-1, .toolbarbutton-icon, .titlebar-button) *
+  ) {
+    color: var(--zen-tab-header-foreground, inherit) !important;
+    fill: currentColor !important;
+    --toolbox-textcolor: var(--zen-tab-header-foreground, currentColor);
+    --toolbarbutton-icon-fill: var(--zen-tab-header-foreground, currentColor);
+    --toolbar-color: var(--zen-tab-header-foreground, currentColor);
+    --toolbar-field-color: var(--zen-tab-header-foreground, currentColor);
+  }
+
+  /* Disabled / muted buttons — slightly faded so they look inactive without going invisible. */
+  #zen-appcontent-navbar-wrapper :is(
+    #nav-bar-customization-target > :not(#urlbar-container)[disabled],
+    #nav-bar-customization-target > :not(#urlbar-container) :is([disabled], [muted], [soundplaying]),
+    #PersonalToolbar :is([disabled], [muted], [soundplaying]),
+    #PanelUI-button [disabled]
+  ) {
+    color: color-mix(in srgb, var(--zen-tab-header-foreground, currentColor) 42%, transparent) !important;
+    fill: currentColor !important;
+    --toolbarbutton-icon-fill: currentColor;
+  }
+
+  #nav-bar {
+    margin-inline-end: 0 !important;
+    padding-inline-start: var(--zen-element-separation) !important;
+    padding-inline-end: var(--zen-element-separation) !important;
+  }
+
+  #zen-tabbox-wrapper {
+    margin: 0 !important;
+  }
+
+  #tabbrowser-tabbox #tabbrowser-tabpanels .browserSidebarContainer {
+    :root:not([zen-no-padding="true"]) &:not(.zen-glance-overlay) {
+      --zen-native-inner-radius: 0 0 var(--zen-native-inner-radius) var(--zen-native-inner-radius);
+      --zen-big-shadow: none;
+    }
+  }
+
+  #sidebar-box {
+    border-radius: 0 !important;
+  }
+}
+
+/* ---------- Sidebar / chrome surfaces tint ---------- */
+
+@layer zen-page-tint {
+  :root[zen-page-tint="on"] {
+    /* Override Zen's window-background element so the outer rim (window edges /
+       chrome-bleed area) tints to match the page instead of showing Zen's
+       theme accent color (e.g., purple). */
+    #zen-browser-background::before,
+    #zen-browser-background::after {
+      background: var(--zen-tab-header-background, var(--zen-main-browser-background)) !important;
+    }
+
+    #main-window,
+    #browser,
+    #appcontent {
+      background-image: none !important;
+      background-color: var(--zen-tab-header-background, var(--zen-main-browser-background)) !important;
+    }
+
+    #navigator-toolbox,
+    .browserSidebarContainer,
+    #zen-sidebar-top-buttons,
+    #zen-sidebar-foot-buttons,
+    #sidebar-box,
+    #sidebar-main,
+    #titlebar,
+    #notifications-toolbar,
+    #zen-media-controls-toolbar,
+    .zen-workspace-tabs-section {
+      appearance: none !important;
+      -moz-appearance: none !important;
+      background-image: none !important;
+      background-color: var(--zen-tab-header-background, var(--zen-main-browser-background)) !important;
+      color: var(--zen-tab-header-foreground, inherit) !important;
+      border-radius: 0 !important;
+      border: none !important;
+      clip-path: none !important;
+      box-shadow: none !important;
+    }
+
+    :root:not([zen-compact-mode="true"]) #navigator-toolbox,
+    :root:not([zen-compact-mode="true"]) .browserSidebarContainer {
+      overflow: visible !important;
+      box-shadow: 0 0 0 6px var(--zen-tab-header-background, var(--zen-main-browser-background)) !important;
+    }
+
+    #zen-sidebar-splitter,
+    #sidebar-splitter {
+      appearance: none !important;
+      -moz-appearance: none !important;
+      background-color: var(--zen-tab-header-background, var(--zen-main-browser-background)) !important;
+      background-image: none !important;
+      border: none !important;
+      min-width: 5px !important;
+      width: 5px !important;
+      opacity: 1 !important;
+    }
+
+    .zen-workspace-empty-space {
+      border: none !important;
+      outline: none !important;
+    }
+
+    .zen-current-workspace-indicator-name {
+      color: var(--zen-tab-header-foreground, inherit) !important;
+    }
+
+    #zen-sidebar-top-buttons toolbarbutton,
+    #zen-sidebar-foot-buttons toolbarbutton,
+    #zen-sidebar-top-buttons .toolbarbutton-icon,
+    #zen-sidebar-foot-buttons .toolbarbutton-icon,
+    #zen-sidebar-top-buttons image,
+    #zen-sidebar-foot-buttons image {
+      color: var(--zen-tab-header-foreground, inherit) !important;
+      fill: var(--zen-tab-header-foreground, currentColor) !important;
+      --toolbarbutton-icon-fill: var(--zen-tab-header-foreground, currentColor) !important;
+      opacity: 1 !important;
+    }
+
+    /* Per-tab text color: NO transition (caused multi-thousand-element paint lag) */
+    .tabbrowser-tab,
+    .tabbrowser-tab .tab-content,
+    .tabbrowser-tab .tab-label,
+    .tabbrowser-tab .tab-icon-image {
+      color: var(--zen-tab-header-foreground, inherit) !important;
+    }
+  }
+}
