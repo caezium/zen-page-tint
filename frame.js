@@ -1,6 +1,7 @@
 // Zen Page Tint — frame script
 // Loaded into the content process via mm.loadFrameScript.
-// Samples the page's background color via computed styles + observes html/body
+// Samples the page's effective background color (pixel-truth via drawWindow,
+// with meta theme-color and computed-style fallbacks), observes html/body
 // mutations, and pushes results to the chrome process via sendAsyncMessage.
 
 (() => {
@@ -19,7 +20,52 @@
     let lastFg = null;
     let debounceTimer = null;
 
-    // Detect "blank" background: missing, keyword 'transparent', or rgba with alpha=0.
+    // ---- Shared canvas (used for both pixel sampling AND color normalization) ----
+    let pixelCanvas = null;
+    let pixelCtx = null;
+    function ensureCanvas() {
+      if (pixelCanvas) return true;
+      try {
+        pixelCanvas = content.document.createElementNS(
+          'http://www.w3.org/1999/xhtml',
+          'canvas'
+        );
+        pixelCanvas.width = 1;
+        pixelCanvas.height = 1;
+        pixelCtx = pixelCanvas.getContext('2d');
+        return !!pixelCtx;
+      } catch (e) {
+        pixelCanvas = null;
+        pixelCtx = null;
+        return false;
+      }
+    }
+
+    // Normalize any CSS color string to canonical `rgb(r, g, b)` via the canvas
+    // color parser — handles hex, hsl, named colors, color() functions, etc.
+    // Returns null for invalid input or fully-transparent values.
+    //
+    // Why this matters: meta theme-color content is commonly "#f5f5f5" or "white".
+    // The chrome side's parseRgb only matches rgb()/rgba(), so without normalization
+    // those would bypass contrast computation and end up with unreadable foreground.
+    function normalizeColor(c) {
+      if (!c || typeof c !== 'string') return null;
+      const trimmed = c.trim();
+      if (!trimmed) return null;
+      if (!ensureCanvas()) return null;
+      try {
+        pixelCtx.clearRect(0, 0, 1, 1);
+        pixelCtx.fillStyle = 'rgba(0, 0, 0, 0)';
+        pixelCtx.fillStyle = trimmed;
+        pixelCtx.fillRect(0, 0, 1, 1);
+        const d = pixelCtx.getImageData(0, 0, 1, 1).data;
+        if (d[3] === 0) return null;
+        return `rgb(${d[0]}, ${d[1]}, ${d[2]})`;
+      } catch (e) {
+        return null;
+      }
+    }
+
     function isBlankBg(c) {
       if (!c) return true;
       if (c === 'transparent') return true;
@@ -27,6 +73,48 @@
       if (!m) return false;
       const parts = m[1].split(',').map((s) => parseFloat(s.trim()));
       return parts.length === 4 && parts[3] === 0;
+    }
+
+    // Pick the active <meta name="theme-color"> respecting `media` attributes.
+    // Spec: multiple meta tags can exist with media queries (typically light/dark);
+    // the first one whose media query matches wins. A meta without media is the default.
+    function pickMetaThemeColor(doc) {
+      const metas = doc.querySelectorAll('meta[name="theme-color"]');
+      if (!metas.length) return null;
+      let fallback = null;
+      for (const m of metas) {
+        const value = m.getAttribute('content');
+        if (!value) continue;
+        const media = m.getAttribute('media');
+        if (!media) {
+          if (!fallback) fallback = value;
+          continue;
+        }
+        try {
+          if (content.matchMedia(media).matches) return value;
+        } catch (e) {}
+      }
+      return fallback;
+    }
+
+    // Read the literal rendered pixel at viewport center via drawWindow.
+    // Reliable because it captures what's actually painted, regardless of how
+    // the bg was set (body/html, gradient, image, overlay div, etc.).
+    function readPixel() {
+      try {
+        const w = content.innerWidth | 0;
+        const h = content.innerHeight | 0;
+        if (w <= 0 || h <= 0) return null;
+        if (!ensureCanvas()) return null;
+        if (!pixelCtx.drawWindow) return null;
+        pixelCtx.clearRect(0, 0, 1, 1);
+        pixelCtx.drawWindow(content, (w / 2) | 0, (h / 2) | 0, 1, 1, 'rgba(0, 0, 0, 0)');
+        const data = pixelCtx.getImageData(0, 0, 1, 1).data;
+        if (data[3] === 0) return null;
+        return `rgb(${data[0]}, ${data[1]}, ${data[2]})`;
+      } catch (e) {
+        return null;
+      }
     }
 
     function read() {
@@ -42,15 +130,29 @@
         let source = '';
 
         // Sample chain (first match wins):
-        //   1. <meta name="theme-color"> — site's declared signal.
-        //   2. body backgroundColor.
-        //   3. html backgroundColor.
-        //   4. Walk up from elementFromPoint to find an ancestor with solid bg.
+        //   1. <meta name="theme-color"> — site's declared signal (media-aware, normalized).
+        //   2. drawWindow pixel at viewport center — ground truth of what's actually painted.
+        //      Promoted over body/html because Gmail-class apps keep body bg light while
+        //      painting dark UI on overlays/wrappers (body lies about visible color).
+        //   3. body backgroundColor — fallback if drawWindow fails.
+        //   4. html backgroundColor.
+        //   5. Walk up from elementFromPoint to find an ancestor with solid bg.
 
-        const themeColorMeta = doc.querySelector('meta[name="theme-color"]');
-        if (themeColorMeta && themeColorMeta.content) {
-          bg = themeColorMeta.content;
-          source = 'meta';
+        const metaValue = pickMetaThemeColor(doc);
+        if (metaValue) {
+          const normalized = normalizeColor(metaValue);
+          if (normalized) {
+            bg = normalized;
+            source = 'meta';
+          }
+        }
+
+        if (!bg) {
+          const pixel = readPixel();
+          if (pixel) {
+            bg = pixel;
+            source = 'pixel';
+          }
         }
 
         if (!bg && bodyStyle && !isBlankBg(bodyStyle.backgroundColor)) {
@@ -124,8 +226,6 @@
       sample(true);
     }
 
-    // Observe html/body attribute changes — sites use diverse attribute names for
-    // theme state, so don't filter at this stage.
     function startObserving() {
       const doc = content.document;
       if (!doc.body) {
@@ -140,7 +240,6 @@
     }
     startObserving();
 
-    // Re-sample shortly after load to catch apps that apply themes post-load.
     content.addEventListener('load', () => {
       content.setTimeout(() => sample(true), 300);
     }, { capture: true });

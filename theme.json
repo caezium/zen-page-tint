@@ -3,7 +3,7 @@
   "name": "Zen Page Tint",
   "description": "Adaptive Zen chrome color from the active page. Single rAF-deferred sampler, per-origin LRU cache, no retry storms, no per-tab paint cascade. Built for heavy-tab sessions.",
   "author": "caezium",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "tags": ["adaptive", "theming"],
   "fork": ["zen"],
   "scripts": {

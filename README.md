@@ -25,10 +25,11 @@ Enable, restart Zen.
 6. Foreground color picked via Rec 601 luminance — black or white for max contrast.
 
 **`frame.js`** runs in the content process. Sample chain (first match wins):
-1. `<meta name="theme-color">`.
-2. `body.backgroundColor`.
-3. `html.backgroundColor`.
-4. Walk up from `elementFromPoint` until a solid bg ancestor.
+1. `<meta name="theme-color">` — respects `media` attributes (light/dark variants honored), normalized to canonical `rgb()` via the canvas color parser so hex / HSL / named colors work.
+2. **`drawWindow` pixel at viewport center** — ground truth of what's actually rendered. Promoted over body/html sampling because apps like Gmail keep `<body>` light while painting dark UI on overlays/wrappers.
+3. `body.backgroundColor`.
+4. `html.backgroundColor`.
+5. Walk up from `elementFromPoint` until a solid bg ancestor.
 
 Also installs a `MutationObserver` on `<html>`/`<body>` to catch in-page theme toggles.
 
