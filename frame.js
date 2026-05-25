@@ -167,31 +167,34 @@
         let source = '';
 
         // Sample chain (first match wins):
-        //   1. <meta name="theme-color"> — site's declared signal, fastest & deterministic.
-        //      Picked respecting the meta's `media` attribute, then normalized to rgb().
-        //   2. drawWindow pixel at viewport center — ground truth of what's actually painted.
-        //      Promoted over body/html sampling because Gmail-class apps keep body bg light
-        //      while painting dark UI on overlays/wrappers, so body lies about visible color.
-        //   3. body backgroundColor — fallback if drawWindow fails.
+        //   1. drawWindow pixel at viewport center — ground truth of what's actually
+        //      painted. Picks up Zen Boost overlays, dark-mode toggles, and any other
+        //      visual change regardless of what the site's <head> declares.
+        //   2. <meta name="theme-color"> — fallback when pixel can't read (rare:
+        //      pre-paint loading state, fully-transparent page). Note this is often
+        //      the address-bar color a site declares for mobile, NOT its page bg —
+        //      e.g. GitHub meta is rgb(30,35,39) but page bg is rgb(13,17,23) — so
+        //      we prefer pixel even when meta is present.
+        //   3. body backgroundColor.
         //   4. html backgroundColor.
         //   5. Walk up from elementFromPoint to find an ancestor with solid bg.
 
-        // 1. theme-color meta (media-aware, then normalized).
-        const metaValue = pickMetaThemeColor(doc);
-        if (metaValue) {
-          const normalized = normalizeColor(metaValue);
-          if (normalized) {
-            bg = normalized;
-            source = 'meta';
-          }
+        // 1. drawWindow pixel — ground truth.
+        const pixel = readPixel();
+        if (pixel) {
+          bg = pixel;
+          source = 'pixel';
         }
 
-        // 2. drawWindow pixel — primary for accuracy.
+        // 2. theme-color meta (media-aware, normalized) — fallback if pixel failed.
         if (!bg) {
-          const pixel = readPixel();
-          if (pixel) {
-            bg = pixel;
-            source = 'pixel';
+          const metaValue = pickMetaThemeColor(doc);
+          if (metaValue) {
+            const normalized = normalizeColor(metaValue);
+            if (normalized) {
+              bg = normalized;
+              source = 'meta';
+            }
           }
         }
 
