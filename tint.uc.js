@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Zen Page Tint
 // @description    Adaptive Zen chrome color from the active page
-// @version        1.0.5
+// @version        1.0.6
 // ==/UserScript==
 
 (() => {
@@ -20,6 +20,7 @@
   // video / animated content in real time. Off by default; flip in about:config:
   //
   //   zen.page-tint.live-mode               (bool, default false)
+  //     Master switch. When off, no polling at all (pure event-driven).
   //   zen.page-tint.live-mode-rate-ms       (int, default 300 — ~3.3fps,
   //                                         matches the YouTube Shorts ambient
   //                                         glow feel)
@@ -27,25 +28,65 @@
   //                                         duration; together with the rate
   //                                         this produces a continuous color
   //                                         slide rather than discrete jumps)
+  //   zen.page-tint.live-mode-always-on     (bool, default false)
+  //     When false (default), live polling only runs while a <video> element
+  //     on the page is actually playing. Static pages (text, images) cost
+  //     nothing because no video → no polling. Toggle to true to force
+  //     polling on every page that's foregrounded (the old all-sites mode).
+  //   zen.page-tint.live-mode-hosts         (string, default '')
+  //     Comma-separated host allowlist. Sites matching any pattern are
+  //     treated as always-on regardless of video state — useful for canvas /
+  //     WebGL video players that auto-detect can't see. Examples:
+  //       example.com, *.spotify.com, music.apple.com
   //
-  // Pref changes require a Zen restart to take effect. Auto-paused per-tab
-  // when the tab is not visible (visibilityState='hidden'), so polling cost
-  // only applies to whichever tab is foregrounded.
+  // Pref changes require a Zen restart to take effect. All polling is paused
+  // when the tab is backgrounded (visibilityState='hidden') so cost is only
+  // ever incurred on the foregrounded tab.
   let LIVE_MODE = false;
   let LIVE_RATE_MS = 300;
   let LIVE_SMOOTH_MS = 400;
+  let LIVE_ALWAYS_ON = false;
+  let LIVE_HOSTS_RAW = '';
   try {
     LIVE_MODE = Services.prefs.getBoolPref('zen.page-tint.live-mode', false);
     LIVE_RATE_MS = Services.prefs.getIntPref('zen.page-tint.live-mode-rate-ms', 300);
     LIVE_SMOOTH_MS = Services.prefs.getIntPref('zen.page-tint.live-mode-smoothing-ms', 400);
+    LIVE_ALWAYS_ON = Services.prefs.getBoolPref('zen.page-tint.live-mode-always-on', false);
+    LIVE_HOSTS_RAW = Services.prefs.getStringPref('zen.page-tint.live-mode-hosts', '');
   } catch {}
+
+  // Parse and normalize the allowlist once at init. Supports exact-host and
+  // leading-wildcard patterns ('*.example.com' matches 'foo.example.com' but
+  // not 'example.com' — explicit, matches how host suffix matching is usually
+  // documented to behave).
+  const LIVE_HOSTS = LIVE_HOSTS_RAW
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+
+  function hostInLiveAllowlist(url) {
+    if (LIVE_HOSTS.length === 0) return false;
+    try {
+      const host = new URL(url).host.toLowerCase();
+      for (const pattern of LIVE_HOSTS) {
+        if (pattern.startsWith('*.')) {
+          if (host.endsWith(pattern.slice(1))) return true;
+        } else if (host === pattern) {
+          return true;
+        }
+      }
+    } catch {}
+    return false;
+  }
 
   // Unconditional one-shot log so users can verify their pref actually got read
   // without enabling the broader DEBUG flag. Cheap (single line per window load).
   try {
     console.log('[zen-page-tint] live-mode pref =', LIVE_MODE,
       '| rate =', LIVE_RATE_MS, 'ms',
-      '| smoothing =', LIVE_SMOOTH_MS, 'ms');
+      '| smoothing =', LIVE_SMOOTH_MS, 'ms',
+      '| always-on =', LIVE_ALWAYS_ON,
+      '| allowlist =', LIVE_HOSTS.length ? LIVE_HOSTS.join(', ') : '(none)');
   } catch {}
 
   const MESSAGE_NAME = 'zen-page-tint:theme';
@@ -176,12 +217,18 @@
       mm.loadFrameScript(FRAME_SCRIPT_URL, false);
       log('frame script load requested');
       // Push live-mode config down to the content scope after load. Frame.js's
-      // listener (re-)configures its setInterval whenever this message arrives,
-      // so re-sending on each load is safe — config stays in sync if the user
-      // ever flips the pref and restarts.
+      // listener (re-)configures its state machine whenever this message
+      // arrives, so re-sending on each load is safe — and necessary, since
+      // alwaysOn is per-URL (the host allowlist applies differently to
+      // different tabs).
       if (LIVE_MODE && mm.sendAsyncMessage) {
         try {
-          mm.sendAsyncMessage(CONFIG_MESSAGE_NAME, { liveRateMs: LIVE_RATE_MS });
+          const url = browser.currentURI?.spec || '';
+          const alwaysOn = LIVE_ALWAYS_ON || hostInLiveAllowlist(url);
+          mm.sendAsyncMessage(CONFIG_MESSAGE_NAME, {
+            liveRateMs: LIVE_RATE_MS,
+            alwaysOn,
+          });
         } catch (e) {
           log('config message send failed', e);
         }

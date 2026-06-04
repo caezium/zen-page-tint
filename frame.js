@@ -274,41 +274,141 @@
     }
     content.__zen_page_tint_sample = sample;
 
-    // Live mode — continuous polling. Started on receipt of the config message
-    // from chrome (sent right after loadFrameScript when the pref is on).
-    // Auto-paused when the tab isn't visible so background tabs cost zero.
-    // sample(false) is used so we only IPC when the bg actually changed —
-    // static pages mid-tick keep the pipeline quiet.
+    // Live mode — continuous polling that lets the chrome tint follow video /
+    // animated content. Driven by a "should poll?" state machine combining:
+    //
+    //   - Visibility: only poll when this tab is the foreground tab
+    //     (visibilityState === 'visible'). Backgrounded tabs cost zero.
+    //   - Always-on flag: if the chrome side flagged this URL as always-on
+    //     (either via the global zen.page-tint.live-mode-always-on pref or
+    //     via the per-host allowlist), we poll whenever the tab is visible.
+    //   - Video detected: if always-on is false, we only poll when at least
+    //     one <video> element on the page is actually playing. Static pages
+    //     (text, no video) cost nothing — no polling at all.
+    //
+    // Video state is tracked via play/pause/ended/emptied events captured at
+    // the document level (bubbles from any <video>) plus a debounced
+    // MutationObserver to catch dynamically-inserted players (YouTube SPA
+    // navigation, ad inserts, lazy-mounted carousels).
     const CONFIG_MESSAGE_NAME = 'zen-page-tint:config';
     let liveTimer = null;
     let liveRateMs = 0;
+    let liveAlwaysOn = false;
+    let liveVideoIsPlaying = false;
     let liveVisibilityWired = false;
+    let liveVideoListenersWired = false;
+    let liveVideoObserver = null;
+    let liveVideoCheckTimer = null;
 
-    function startLiveMode(rateMs) {
-      if (!(rateMs > 0)) return;
-      liveRateMs = rateMs;
-      stopLiveMode();
-      const tick = () => {
-        if (content.document.visibilityState === 'visible') {
-          sample(false);
-        }
-      };
-      liveTimer = content.setInterval(tick, liveRateMs);
-      if (!liveVisibilityWired) {
-        liveVisibilityWired = true;
-        content.document.addEventListener('visibilitychange', () => {
-          // Resume: fire one immediate sample on becoming visible so the chrome
-          // catches up to anything that changed while we were paused.
-          if (content.document.visibilityState === 'visible') sample(true);
-        });
-      }
-    }
-
-    function stopLiveMode() {
-      if (liveTimer) {
+    function updatePollingState() {
+      const shouldPoll = liveRateMs > 0
+        && content.document.visibilityState === 'visible'
+        && (liveAlwaysOn || liveVideoIsPlaying);
+      if (shouldPoll && !liveTimer) {
+        liveTimer = content.setInterval(() => sample(false), liveRateMs);
+      } else if (!shouldPoll && liveTimer) {
         try { content.clearInterval(liveTimer); } catch {}
         liveTimer = null;
       }
+    }
+
+    function checkVideoState() {
+      const doc = content.document;
+      if (!doc) {
+        if (liveVideoIsPlaying) { liveVideoIsPlaying = false; updatePollingState(); }
+        return;
+      }
+      let anyPlaying = false;
+      try {
+        const videos = doc.querySelectorAll('video');
+        for (const v of videos) {
+          // Playing = not paused, not ended, has enough data to actually
+          // render frames. Filtering on readyState>=2 (HAVE_CURRENT_DATA)
+          // avoids triggering on a <video> that's been mounted but hasn't
+          // loaded yet, which would briefly start the poller for no reason.
+          if (!v.paused && !v.ended && v.readyState >= 2) {
+            anyPlaying = true;
+            break;
+          }
+        }
+      } catch {}
+      if (liveVideoIsPlaying !== anyPlaying) {
+        liveVideoIsPlaying = anyPlaying;
+        updatePollingState();
+      }
+    }
+
+    function scheduleVideoCheck() {
+      if (liveVideoCheckTimer) return;
+      liveVideoCheckTimer = content.setTimeout(() => {
+        liveVideoCheckTimer = null;
+        checkVideoState();
+      }, 250);
+    }
+
+    function wireVideoDetection() {
+      if (liveVideoListenersWired) {
+        // Already set up — just re-check state in case it's stale (e.g. user
+        // navigated from a video page to a non-video page and config is being
+        // re-sent).
+        checkVideoState();
+        return;
+      }
+      liveVideoListenersWired = true;
+      const doc = content.document;
+      // Capture-phase listeners on the document so we get events from any
+      // <video> regardless of where it's mounted in the tree.
+      const events = ['play', 'playing', 'pause', 'ended', 'emptied', 'abort'];
+      for (const ev of events) {
+        try { doc.addEventListener(ev, scheduleVideoCheck, { capture: true }); } catch {}
+      }
+      // Catch dynamically-inserted <video> nodes (YouTube SPA nav, etc.).
+      try {
+        liveVideoObserver = new content.MutationObserver(scheduleVideoCheck);
+        liveVideoObserver.observe(doc.body || doc.documentElement, {
+          childList: true,
+          subtree: true,
+        });
+      } catch {}
+      checkVideoState();
+    }
+
+    function wireVisibilityListener() {
+      if (liveVisibilityWired) return;
+      liveVisibilityWired = true;
+      try {
+        content.document.addEventListener('visibilitychange', () => {
+          if (content.document.visibilityState === 'visible') {
+            // Catch the chrome up to anything that changed while we were paused.
+            sample(true);
+            // In video-detect mode the play state might have changed too
+            // (autoplay started while hidden, etc.) — re-check.
+            if (!liveAlwaysOn && liveVideoListenersWired) checkVideoState();
+          }
+          updatePollingState();
+        });
+      } catch {}
+    }
+
+    function configureLiveMode(rateMs, alwaysOn) {
+      // Reconfigured on every config message — chrome sends one after each
+      // loadFrameScript, which means every TabSelect cache-miss and every
+      // top-level navigation. Cheap because listeners/observers only attach
+      // once (guarded by the *Wired flags).
+      liveRateMs = rateMs > 0 ? rateMs : 0;
+      liveAlwaysOn = !!alwaysOn;
+      wireVisibilityListener();
+      if (!liveAlwaysOn && liveRateMs > 0) {
+        wireVideoDetection();
+      }
+      updatePollingState();
+    }
+
+    function disableLiveMode() {
+      liveRateMs = 0;
+      liveAlwaysOn = false;
+      liveVideoIsPlaying = false;
+      updatePollingState();
     }
 
     // Frame-script message listeners want an object with a receiveMessage()
@@ -321,10 +421,11 @@
         try {
           const data = msg?.data || {};
           try {
-            console.log('[zen-page-tint frame] config received, rate =', data.liveRateMs);
+            console.log('[zen-page-tint frame] config received, rate =', data.liveRateMs,
+              '| alwaysOn =', !!data.alwaysOn);
           } catch {}
-          if (data.liveRateMs > 0) startLiveMode(data.liveRateMs);
-          else stopLiveMode();
+          if (data.liveRateMs > 0) configureLiveMode(data.liveRateMs, data.alwaysOn);
+          else disableLiveMode();
         } catch (e) {
           try { console.error('[zen-page-tint frame] config handler error:', e); } catch {}
         }
