@@ -23,15 +23,30 @@
     content.__zen_page_tint_inited = true;
 
     const MESSAGE_NAME = 'zen-page-tint:theme';
-    const PIXEL_SAMPLE_SIZE = 3; // 3x3 region around viewport center, averaged.
+    // Sampling layout:
+    //   - Source: a centered rectangle covering PIXEL_SAMPLE_FRACTION of the
+    //     viewport (default 60%). The outer 20% margin on each side is skipped
+    //     because that's typically where scrollbars, browser-injected overlays,
+    //     and content edges live — sampling them muddies the dominant color.
+    //   - Destination: a PIXEL_SAMPLE_GRID x PIXEL_SAMPLE_GRID canvas. We use
+    //     ctx.scale to downsample the source region into the grid, then average
+    //     across all GRID*GRID cells. With drawWindow doing the actual
+    //     compositing, the GPU handles the downsample; we just walk the grid.
+    //   - Result: a color representative of the central area's dominant tone
+    //     rather than whatever single element happens to land at viewport
+    //     center. Makes a big difference on video (averages the surrounding
+    //     glow color instead of the frame's focal subject) and on pages with a
+    //     colored hero bordered by negative space.
+    const PIXEL_SAMPLE_FRACTION = 0.6;
+    const PIXEL_SAMPLE_GRID = 16;
     let lastBg = null;
     let debounceTimer = null;
     let lastRescheduleAt = 0;
 
     // ---- Canvas (shared for pixel sampling AND color normalization) ----
-    // Lazy-init: only created on first need. Sized to PIXEL_SAMPLE_SIZE x PIXEL_SAMPLE_SIZE.
-    // Reused across sample() calls to avoid per-event allocation/GC churn on sites with
-    // frequent theme mutations.
+    // Lazy-init: only created on first need. Sized to PIXEL_SAMPLE_GRID square.
+    // Reused across sample() calls to avoid per-event allocation/GC churn on
+    // sites with frequent theme mutations.
     let pixelCanvas = null;
     let pixelCtx = null;
     function ensureCanvas() {
@@ -41,8 +56,8 @@
           'http://www.w3.org/1999/xhtml',
           'canvas'
         );
-        pixelCanvas.width = PIXEL_SAMPLE_SIZE;
-        pixelCanvas.height = PIXEL_SAMPLE_SIZE;
+        pixelCanvas.width = PIXEL_SAMPLE_GRID;
+        pixelCanvas.height = PIXEL_SAMPLE_GRID;
         pixelCtx = pixelCanvas.getContext('2d');
         return !!pixelCtx;
       } catch (e) {
@@ -114,10 +129,11 @@
       return fallback;
     }
 
-    // Read the literal rendered pixels at viewport center via drawWindow.
-    // Samples a PIXEL_SAMPLE_SIZE x PIXEL_SAMPLE_SIZE block and averages non-transparent
-    // pixels — more robust than a single-pixel read against anti-aliased text edges or
-    // narrow dividers happening to land at viewport center.
+    // Sample a wide central region (PIXEL_SAMPLE_FRACTION of the viewport),
+    // downsample it into a PIXEL_SAMPLE_GRID x PIXEL_SAMPLE_GRID block via
+    // ctx.scale + drawWindow, and average non-transparent cells. This catches
+    // the dominant color of the central content rather than whatever single
+    // element happens to land at viewport center.
     function readPixel() {
       try {
         const w = content.innerWidth | 0;
@@ -125,21 +141,27 @@
         if (w <= 0 || h <= 0) return null;
         if (!ensureCanvas()) return null;
         if (!pixelCtx.drawWindow) return null;
-        const half = (PIXEL_SAMPLE_SIZE / 2) | 0;
-        const cx = ((w / 2) | 0) - half;
-        const cy = ((h / 2) | 0) - half;
-        pixelCtx.clearRect(0, 0, PIXEL_SAMPLE_SIZE, PIXEL_SAMPLE_SIZE);
-        pixelCtx.drawWindow(
-          content,
-          cx,
-          cy,
-          PIXEL_SAMPLE_SIZE,
-          PIXEL_SAMPLE_SIZE,
-          'rgba(0, 0, 0, 0)'
-        );
-        const img = pixelCtx.getImageData(0, 0, PIXEL_SAMPLE_SIZE, PIXEL_SAMPLE_SIZE).data;
+
+        // Source rect: centered, sized to PIXEL_SAMPLE_FRACTION of the viewport.
+        // Minimum source side of 8px keeps math sane on tiny windows.
+        const sw = Math.max(8, (w * PIXEL_SAMPLE_FRACTION) | 0);
+        const sh = Math.max(8, (h * PIXEL_SAMPLE_FRACTION) | 0);
+        const sx = ((w - sw) / 2) | 0;
+        const sy = ((h - sh) / 2) | 0;
+
+        pixelCtx.clearRect(0, 0, PIXEL_SAMPLE_GRID, PIXEL_SAMPLE_GRID);
+        // Scale transforms drawWindow's source coordinates so the source
+        // rectangle (sw x sh) lands inside the destination grid. The compositor
+        // does the actual resampling, which is cheaper than walking 100k+
+        // pixels in JS.
+        pixelCtx.save();
+        pixelCtx.scale(PIXEL_SAMPLE_GRID / sw, PIXEL_SAMPLE_GRID / sh);
+        pixelCtx.drawWindow(content, sx, sy, sw, sh, 'rgba(0, 0, 0, 0)');
+        pixelCtx.restore();
+
+        const img = pixelCtx.getImageData(0, 0, PIXEL_SAMPLE_GRID, PIXEL_SAMPLE_GRID).data;
         let r = 0, g = 0, b = 0, n = 0;
-        for (let i = 0; i < PIXEL_SAMPLE_SIZE * PIXEL_SAMPLE_SIZE; i++) {
+        for (let i = 0; i < PIXEL_SAMPLE_GRID * PIXEL_SAMPLE_GRID; i++) {
           const off = i * 4;
           if (img[off + 3] === 0) continue; // skip transparent
           r += img[off];
@@ -289,13 +311,30 @@
       }
     }
 
+    // Frame-script message listeners want an object with a receiveMessage()
+    // method. The bare-function form silently no-ops in some content scopes,
+    // which is why an earlier version of live mode never received the chrome
+    // side's config message. The object form is the documented API and works
+    // uniformly across frame-script contexts.
+    const configListener = {
+      receiveMessage(msg) {
+        try {
+          const data = msg?.data || {};
+          try {
+            console.log('[zen-page-tint frame] config received, rate =', data.liveRateMs);
+          } catch {}
+          if (data.liveRateMs > 0) startLiveMode(data.liveRateMs);
+          else stopLiveMode();
+        } catch (e) {
+          try { console.error('[zen-page-tint frame] config handler error:', e); } catch {}
+        }
+      }
+    };
     try {
-      addMessageListener(CONFIG_MESSAGE_NAME, (msg) => {
-        const data = msg?.data || {};
-        if (data.liveRateMs > 0) startLiveMode(data.liveRateMs);
-        else stopLiveMode();
-      });
-    } catch {}
+      addMessageListener(CONFIG_MESSAGE_NAME, configListener);
+    } catch (e) {
+      try { console.error('[zen-page-tint frame] addMessageListener failed:', e); } catch {}
+    }
 
     function debouncedSample() {
       if (debounceTimer) return;

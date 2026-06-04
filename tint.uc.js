@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Zen Page Tint
 // @description    Adaptive Zen chrome color from the active page
-// @version        1.0.4
+// @version        1.0.5
 // ==/UserScript==
 
 (() => {
@@ -38,6 +38,14 @@
     LIVE_MODE = Services.prefs.getBoolPref('zen.page-tint.live-mode', false);
     LIVE_RATE_MS = Services.prefs.getIntPref('zen.page-tint.live-mode-rate-ms', 300);
     LIVE_SMOOTH_MS = Services.prefs.getIntPref('zen.page-tint.live-mode-smoothing-ms', 400);
+  } catch {}
+
+  // Unconditional one-shot log so users can verify their pref actually got read
+  // without enabling the broader DEBUG flag. Cheap (single line per window load).
+  try {
+    console.log('[zen-page-tint] live-mode pref =', LIVE_MODE,
+      '| rate =', LIVE_RATE_MS, 'ms',
+      '| smoothing =', LIVE_SMOOTH_MS, 'ms');
   } catch {}
 
   const MESSAGE_NAME = 'zen-page-tint:theme';
