@@ -236,3 +236,49 @@
     }
   }
 }
+
+/* ---------- Live mode smoothing (opt-in via zen.page-tint.live-mode) ----------
+ *
+ * Live mode polls the page color several times per second (default ~3 fps to
+ * match the YouTube Shorts ambient-glow feel). Without smoothing this would
+ * read as visible color steps; with a transition slightly longer than the
+ * polling interval the eye sees a continuous slide between samples.
+ *
+ * Scoped strictly to :root[zen-page-tint-live="on"] so default users get the
+ * snap-color behavior they're used to. The transition duration is set by JS
+ * via --zpt-live-smoothing-ms (default 400ms). Transitions are NOT applied to
+ * any .tabbrowser-tab elements — those are still color-snapped to avoid the
+ * paint cascade at high tab counts.
+ */
+:root[zen-page-tint-live="on"] {
+  #zen-appcontent-navbar-wrapper {
+    transition: background-color var(--zpt-live-smoothing-ms, 400ms) ease-out,
+                color var(--zpt-live-smoothing-ms, 400ms) ease-out !important;
+  }
+}
+
+@layer zen-page-tint {
+  :root[zen-page-tint-live="on"][zen-page-tint="on"] {
+    #zen-browser-background::before,
+    #zen-browser-background::after,
+    #main-window,
+    #browser,
+    #appcontent,
+    #navigator-toolbox,
+    .browserSidebarContainer,
+    #zen-sidebar-top-buttons,
+    #zen-sidebar-foot-buttons,
+    #sidebar-box,
+    #sidebar-main,
+    #titlebar,
+    #notifications-toolbar,
+    #zen-media-controls-toolbar,
+    .zen-workspace-tabs-section,
+    #zen-sidebar-splitter,
+    #sidebar-splitter {
+      transition: background-color var(--zpt-live-smoothing-ms, 400ms) ease-out,
+                  color var(--zpt-live-smoothing-ms, 400ms) ease-out,
+                  box-shadow var(--zpt-live-smoothing-ms, 400ms) ease-out !important;
+    }
+  }
+}

@@ -252,6 +252,51 @@
     }
     content.__zen_page_tint_sample = sample;
 
+    // Live mode — continuous polling. Started on receipt of the config message
+    // from chrome (sent right after loadFrameScript when the pref is on).
+    // Auto-paused when the tab isn't visible so background tabs cost zero.
+    // sample(false) is used so we only IPC when the bg actually changed —
+    // static pages mid-tick keep the pipeline quiet.
+    const CONFIG_MESSAGE_NAME = 'zen-page-tint:config';
+    let liveTimer = null;
+    let liveRateMs = 0;
+    let liveVisibilityWired = false;
+
+    function startLiveMode(rateMs) {
+      if (!(rateMs > 0)) return;
+      liveRateMs = rateMs;
+      stopLiveMode();
+      const tick = () => {
+        if (content.document.visibilityState === 'visible') {
+          sample(false);
+        }
+      };
+      liveTimer = content.setInterval(tick, liveRateMs);
+      if (!liveVisibilityWired) {
+        liveVisibilityWired = true;
+        content.document.addEventListener('visibilitychange', () => {
+          // Resume: fire one immediate sample on becoming visible so the chrome
+          // catches up to anything that changed while we were paused.
+          if (content.document.visibilityState === 'visible') sample(true);
+        });
+      }
+    }
+
+    function stopLiveMode() {
+      if (liveTimer) {
+        try { content.clearInterval(liveTimer); } catch {}
+        liveTimer = null;
+      }
+    }
+
+    try {
+      addMessageListener(CONFIG_MESSAGE_NAME, (msg) => {
+        const data = msg?.data || {};
+        if (data.liveRateMs > 0) startLiveMode(data.liveRateMs);
+        else stopLiveMode();
+      });
+    } catch {}
+
     function debouncedSample() {
       if (debounceTimer) return;
       debounceTimer = content.setTimeout(() => {

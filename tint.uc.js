@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Zen Page Tint
 // @description    Adaptive Zen chrome color from the active page
-// @version        1.0.3
+// @version        1.0.4
 // ==/UserScript==
 
 (() => {
@@ -16,9 +16,41 @@
   } catch (e) {}
   const log = DEBUG ? (...args) => console.log('[zen-page-tint]', ...args) : () => {};
 
+  // Live mode — optional continuous polling that lets the chrome tint follow
+  // video / animated content in real time. Off by default; flip in about:config:
+  //
+  //   zen.page-tint.live-mode               (bool, default false)
+  //   zen.page-tint.live-mode-rate-ms       (int, default 300 — ~3.3fps,
+  //                                         matches the YouTube Shorts ambient
+  //                                         glow feel)
+  //   zen.page-tint.live-mode-smoothing-ms  (int, default 400 — CSS transition
+  //                                         duration; together with the rate
+  //                                         this produces a continuous color
+  //                                         slide rather than discrete jumps)
+  //
+  // Pref changes require a Zen restart to take effect. Auto-paused per-tab
+  // when the tab is not visible (visibilityState='hidden'), so polling cost
+  // only applies to whichever tab is foregrounded.
+  let LIVE_MODE = false;
+  let LIVE_RATE_MS = 300;
+  let LIVE_SMOOTH_MS = 400;
+  try {
+    LIVE_MODE = Services.prefs.getBoolPref('zen.page-tint.live-mode', false);
+    LIVE_RATE_MS = Services.prefs.getIntPref('zen.page-tint.live-mode-rate-ms', 300);
+    LIVE_SMOOTH_MS = Services.prefs.getIntPref('zen.page-tint.live-mode-smoothing-ms', 400);
+  } catch {}
+
   const MESSAGE_NAME = 'zen-page-tint:theme';
+  const CONFIG_MESSAGE_NAME = 'zen-page-tint:config';
   const FRAME_SCRIPT_URL = 'chrome://sine/content/zen-page-tint/frame.js';
   const root = document.documentElement;
+
+  // Flag the root so the stylesheet can scope the smoothing transitions to
+  // live mode only. Off-by-default users keep the snap-color behavior they had.
+  if (LIVE_MODE) {
+    root.setAttribute('zen-page-tint-live', 'on');
+    root.style.setProperty('--zpt-live-smoothing-ms', `${LIVE_SMOOTH_MS}ms`);
+  }
 
   // Cache: origin+path → bg string (canonical rgb()). Bounded LRU (true access-order).
   // We store only `bg` because `fg` is always derived deterministically via readableFg(bg).
@@ -135,6 +167,17 @@
     try {
       mm.loadFrameScript(FRAME_SCRIPT_URL, false);
       log('frame script load requested');
+      // Push live-mode config down to the content scope after load. Frame.js's
+      // listener (re-)configures its setInterval whenever this message arrives,
+      // so re-sending on each load is safe — config stays in sync if the user
+      // ever flips the pref and restarts.
+      if (LIVE_MODE && mm.sendAsyncMessage) {
+        try {
+          mm.sendAsyncMessage(CONFIG_MESSAGE_NAME, { liveRateMs: LIVE_RATE_MS });
+        } catch (e) {
+          log('config message send failed', e);
+        }
+      }
     } catch (e) {
       log('frame script load failed', e);
     }
