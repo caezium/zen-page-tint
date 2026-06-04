@@ -163,7 +163,6 @@
     }
 
     #navigator-toolbox,
-    .browserSidebarContainer,
     #zen-sidebar-top-buttons,
     #zen-sidebar-foot-buttons,
     #sidebar-box,
@@ -181,6 +180,24 @@
       border: none !important;
       clip-path: none !important;
       box-shadow: none !important;
+    }
+
+    /* .browserSidebarContainer directly backs the web content (the <browser>
+       renders inside it), so it must NOT carry the page tint as its background.
+       A page that paints no opaque background of its own — a transparent or
+       "blank" html/body, e.g. badges.henryzh.dev — would otherwise reveal the
+       tint straight through the content, making a white page look tinted.
+       Pin it to the browser's neutral default page background (Canvas, which
+       is light/dark-scheme aware) so transparent pages render normally. The
+       tinted surround is unaffected: it still comes from the 6px box-shadow
+       ring below, #appcontent filling the frame gap, and the #zen-browser-
+       background rim. We keep it OUT of the chrome-surface rule above rather
+       than overriding, so the tint variable never lands on this element at all.
+       (Resets like appearance/border/clip-path aren't needed here — this is a
+       plain content container, not a themed chrome surface.) */
+    .browserSidebarContainer {
+      background-image: none !important;
+      background-color: Canvas !important;
     }
 
     :root:not([zen-compact-mode="true"]) #navigator-toolbox,
@@ -245,31 +262,58 @@
  * colors instead of snapping. Duration is set by JS via the
  * --zpt-live-smoothing-ms CSS variable (default 1000ms).
  *
- * Scoped to :root[zen-page-tint="on"] so transitions don't apply on
- * about:/chrome: pages where we clear the tint entirely.
+ * Scoped to :root[zen-page-tint-active="on"] — the persistent "mod is loaded"
+ * marker — NOT :root[zen-page-tint="on"] (the per-page "this page is tinted"
+ * flag). This matters when leaving a tinted page for an untinted one
+ * (about:/chrome:): the per-page flag and the tint variable are removed in the
+ * same restyle, so a transition scoped to it would disappear at the exact
+ * moment the color reverts and the chrome would SNAP back to default. Arming on
+ * the persistent marker keeps a transition in effect across the clear, so the
+ * chrome fades back. The marker is dropped only on mod teardown, so no
+ * transitions apply when the mod is inactive.
  *
  * IMPORTANT: containers like #navigator-toolbox / #titlebar /
  * .zen-workspace-tabs-section contain the tab strip (1000+ tabs at scale).
- * Putting `color` in the transition on those parents causes every descendant
- * that inherits `color` (.tabbrowser-tab, .tab-content, .tab-label) to
- * visually animate with the parent — thousands of elements interpolating
- * across the 1s transition saturates the compositor and lags the sidebar.
+ * Two perf constraints follow from that:
+ *
+ *   1. `color` is excluded from the transition on those parents. Every
+ *      descendant that inherits `color` (.tabbrowser-tab, .tab-content,
+ *      .tab-label) would otherwise animate with the parent — thousands of
+ *      elements interpolating across the 1s transition saturate the compositor
+ *      and lag the sidebar.
+ *   2. `box-shadow` is excluded too. The non-compact tinting rule paints a 6px
+ *      spread shadow whose color is the tint variable; in live mode that
+ *      variable changes every poll tick, so animating box-shadow would
+ *      continuously repaint these large tab-strip-containing surfaces — the
+ *      same class of compositor pressure prior commits removed for `color`.
+ *      The shadow snaps to its new color instantly instead (imperceptible at a
+ *      6px spread); only background-color fades.
  *
  * So we split:
- *   - URL bar wrapper transitions BOTH bg + color (no tab descendants → safe)
- *   - Tab-strip-containing surfaces transition ONLY bg + box-shadow; color
- *     snaps on those (still ends up at the right value via the !important
- *     color rules below — just no animated propagation).
+ *   - URL bar wrapper transitions BOTH bg + color (no tab descendants → safe).
+ *   - All the chrome surfaces (incl. the tab-strip-containing #navigator-toolbox
+ *     and .zen-workspace-tabs-section) transition ONLY background-color, so the
+ *     sidebar fades smoothly between page colors.
+ *   - color and box-shadow are never transitioned on these (they snap to the
+ *     right value via the !important rules above — no animated propagation to
+ *     thousands of tab descendants, no continuous shadow repaint).
  *   - .tabbrowser-tab elements get explicit transition:none belt-and-suspenders
  *     to suppress any inherited transition behavior that might still creep in.
+ *
+ * KNOWN COST: animating background-color on the large tab-strip surfaces means a
+ * color change repaints them; if that lands while the sidebar is being scrolled
+ * it can hitch at very high tab counts. Detecting "is the user scrolling?" from
+ * chrome scroll events proved unreliable here (they fire spuriously), so the
+ * smooth fade is kept and the scroll-time hitch is accepted as a tradeoff — tune
+ * live-mode rate/threshold down if it bothers you.
  */
-:root[zen-page-tint="on"] #zen-appcontent-navbar-wrapper {
+:root[zen-page-tint-active="on"] #zen-appcontent-navbar-wrapper {
   transition: background-color var(--zpt-live-smoothing-ms, 1000ms) ease-out,
               color var(--zpt-live-smoothing-ms, 1000ms) ease-out !important;
 }
 
 @layer zen-page-tint {
-  :root[zen-page-tint="on"] {
+  :root[zen-page-tint-active="on"] {
     #zen-browser-background::before,
     #zen-browser-background::after,
     #main-window,
@@ -287,9 +331,9 @@
     .zen-workspace-tabs-section,
     #zen-sidebar-splitter,
     #sidebar-splitter {
-      /* bg + shadow only — see comment above for why color is excluded */
-      transition: background-color var(--zpt-live-smoothing-ms, 1000ms) ease-out,
-                  box-shadow var(--zpt-live-smoothing-ms, 1000ms) ease-out !important;
+      /* background-color only — color and box-shadow are deliberately excluded
+         (see comment above for the per-tab-paint and continuous-repaint cost). */
+      transition: background-color var(--zpt-live-smoothing-ms, 1000ms) ease-out !important;
     }
 
     /* Belt-and-suspenders: explicitly suppress any transition on tab elements

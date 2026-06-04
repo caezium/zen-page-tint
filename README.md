@@ -45,16 +45,23 @@ In `style.css` `:root`:
 --zpt-frame-shadow: ...;    /* drop shadow on content frame */
 ```
 
-In `about:config`:
+In `about:config` (pref changes take effect on the next Zen restart):
 
 | Pref | Default | Effect |
 |---|---|---|
 | `zen.page-tint.debug` | `false` | When `true`, logs diagnostic events to the Browser Console (`Cmd-Shift-J` / `Ctrl-Shift-J`). Toggle live. |
+| `zen.page-tint.live-mode` | `true` | Master switch for live mode — continuous polling so the chrome tint follows video / animated content. When off, the tint is purely event-driven. |
+| `zen.page-tint.live-mode-rate-ms` | `2000` | The **idle** poll interval (0.5 Hz). Sampling is adaptive: it speeds up to `rate ÷ 4` (floored at 250 ms / 4 Hz) while the color is actively changing, then backs off to this rate once it's stable. So scene changes are followed responsively while static frames stay cheap. |
+| `zen.page-tint.live-mode-threshold` | `8` | Minimum per-channel color change (0–255) needed to actually re-tint the chrome during live polling. Imperceptible frame-to-frame jitter below this is ignored, so the chrome doesn't churn (and the adaptive rate backs off) on near-static scenes. `0` = re-tint on any change. |
+| `zen.page-tint.live-mode-smoothing-ms` | `1000` | Duration of the CSS fade applied to **every** tint change (live ticks, event-driven samples, and tab-switch cache hits). |
+| `zen.page-tint.live-mode-always-on` | `false` | When `false`, live polling only runs while a `<video>` on the page is actually playing — static pages cost nothing. Set `true` to poll every foregrounded page regardless. |
+| `zen.page-tint.live-mode-hosts` | `''` | Comma-separated host allowlist; matching sites are treated as always-on. The supported workaround for players auto-detect can't see — canvas/WebGL players and cross-origin `<iframe>` embeds. Matched by hostname, so port-independent (`localhost` matches `localhost:3000`). Supports `*.example.com`. Example: `example.com, *.spotify.com, localhost`. |
 
 ## Known limitations
 
 - **Boost edits on the currently open page require a refresh.** When you live-edit a [Zen Boost](https://zen-browser.app/) on a page that's already loaded, the chrome tint won't update until you refresh the page (or switch to another tab and back). Boosts apply styling via `CSSStyleSheet.insertRule` and browser-level user-stylesheets, neither of which fires a DOM `MutationObserver`. Background polling would catch it but at a constant CPU cost that didn't feel worth it — open to revisiting if folks ask.
 - **YouTube in fullscreen video** mode samples the current video frame's center pixel, which is whatever's on screen at that moment. Outside fullscreen it samples the player chrome and works correctly.
+- **Live mode doesn't auto-detect video inside cross-origin `<iframe>` embeds** (the common YouTube/Vimeo/Spotify embed on a third-party page). That `<video>` lives in a separate browsing context, so its play/pause events never reach the parent document and auto-detect can't see it. The tint *would* follow it correctly if polling ran — only the trigger is missing. Workaround: add the host to `zen.page-tint.live-mode-hosts` to force always-on polling there. A site's own pages (e.g. youtube.com itself, where the `<video>` is same-origin) work without this.
 - **`drawWindow` is flagged non-standard in MDN** and may be removed in a future Gecko. If that happens, the meta-tag and computed-style fallbacks still work but Gmail-class accuracy is lost. No drop-in replacement exists today.
 
 ## How it works
@@ -68,7 +75,7 @@ In `about:config`:
 6. Foreground color picked via Rec 601 luminance — black or white for max contrast.
 
 **`frame.js`** runs in the content process. Sample chain (first match wins):
-1. **`drawWindow` pixel at viewport center (3×3 averaged)** — ground truth of what's actually painted. Picks up Zen Boost overlays, dark-mode toggles, Gmail-class apps where `<body>` lies about the visible color.
+1. **`drawWindow` pixel of the central 60% of the viewport, downsampled to a 16×16 grid and averaged** — ground truth of what's actually painted, weighted to the dominant central tone rather than whatever single element lands dead-center. Picks up Zen Boost overlays, dark-mode toggles, Gmail-class apps where `<body>` lies about the visible color.
 2. `<meta name="theme-color">` — fallback for the rare case where pixel can't read (pre-paint, fully transparent page). Note this is often the *address-bar* color a site declares for mobile, **not** its page bg — e.g. GitHub's meta is `rgb(30,35,39)` but its actual page bg is `rgb(13,17,23)` — so we prefer pixel even when meta is present. Media-aware (light/dark variants honored) and normalized to canonical `rgb()` via the canvas color parser, so hex/HSL/named all work.
 3. `body.backgroundColor`.
 4. `html.backgroundColor`.

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Zen Page Tint
 // @description    Adaptive Zen chrome color from the active page
-// @version        1.0.8
+// @version        1.1.0
 // ==/UserScript==
 
 (() => {
@@ -17,54 +17,73 @@
   const log = DEBUG ? (...args) => console.log('[zen-page-tint]', ...args) : () => {};
 
   // Live mode — optional continuous polling that lets the chrome tint follow
-  // video / animated content in real time. Off by default; flip in about:config:
+  // video / animated content in real time. On by default (auto-detected against
+  // <video>, so static pages cost zero). Tunable in about:config:
   //
-  //   zen.page-tint.live-mode               (bool, default false)
+  //   zen.page-tint.live-mode               (bool, default true)
   //     Master switch. When off, no polling at all (pure event-driven).
-  //   zen.page-tint.live-mode-rate-ms       (int, default 300 — ~3.3fps,
-  //                                         matches the YouTube Shorts ambient
-  //                                         glow feel)
-  //   zen.page-tint.live-mode-smoothing-ms  (int, default 400 — CSS transition
-  //                                         duration; together with the rate
-  //                                         this produces a continuous color
-  //                                         slide rather than discrete jumps)
+  //   zen.page-tint.live-mode-rate-ms       (int, default 2000 — 0.5 Hz)
+  //     The IDLE/ceiling poll interval. Sampling is adaptive: while the page
+  //     color is actively changing we poll faster (down to rate/4, floored at
+  //     250ms / 4 Hz) so scene changes are followed responsively, then back off
+  //     to this rate once the color is stable. A static frame costs ~this rate;
+  //     a busy video samples up to 4x faster. The smoothing transition still
+  //     interpolates between samples either way.
+  //   zen.page-tint.live-mode-threshold     (int, default 8 — 0..255)
+  //     Minimum per-channel color change required to actually re-tint the
+  //     chrome during live polling. Imperceptible frame-to-frame jitter below
+  //     this is ignored, so the chrome doesn't churn (continuous IPC + a 1s
+  //     fade on the big tab-strip surfaces) on near-static scenes. It also
+  //     drives the adaptive backoff above — sub-threshold ticks count as
+  //     "stable". Set 0 to re-tint on any change at all (the old behavior).
+  //   zen.page-tint.live-mode-smoothing-ms  (int, default 1000 — CSS transition
+  //                                         duration applied to EVERY tint change,
+  //                                         live or event-driven; tab-switch
+  //                                         cache hits fade with this too)
   //   zen.page-tint.live-mode-always-on     (bool, default false)
   //     When false (default), live polling only runs while a <video> element
   //     on the page is actually playing. Static pages (text, images) cost
-  //     nothing because no video → no polling. Toggle to true to force
-  //     polling on every page that's foregrounded (the old all-sites mode).
+  //     nothing because no video → no polling. Set true to force polling on
+  //     every foregrounded page regardless of video state.
   //   zen.page-tint.live-mode-hosts         (string, default '')
-  //     Comma-separated host allowlist. Sites matching any pattern are
-  //     treated as always-on regardless of video state — useful for canvas /
-  //     WebGL video players that auto-detect can't see. Examples:
-  //       example.com, *.spotify.com, music.apple.com
+  //     Comma-separated host allowlist. Sites matching any pattern are treated
+  //     as always-on regardless of video state. This is the supported
+  //     workaround for players auto-detect can't see: canvas/WebGL players and
+  //     cross-origin <iframe> video embeds (YouTube/Vimeo/Spotify embedded on a
+  //     third-party page — their <video> lives in a separate browsing context,
+  //     so its media events never reach this document). Matched by hostname, so
+  //     entries are port-independent. Examples:
+  //       example.com, *.spotify.com, music.apple.com, localhost
   //
-  // Pref changes require a Zen restart to take effect. All polling is paused
-  // when the tab is backgrounded (visibilityState='hidden') so cost is only
-  // ever incurred on the foregrounded tab.
-  // Defaults: live-mode on (auto-detected against <video>, so static sites
-  // cost zero), 2 Hz poll rate, 1000ms smoothing transition. The slower poll
-  // is plausible because the smoothing transition interpolates between
-  // samples — the eye sees continuous color motion even when we sample at
-  // 0.5x/sec. Tab-switch fades use the same transition, so chrome color
-  // slides smoothly when revisiting cached tabs too.
+  // Disabling live mode (master switch off) requires a Zen restart: config is
+  // pushed to content only at frame-script load time, and the off state is
+  // expressed as "send no config" rather than a runtime teardown message — so
+  // there's no live disable path. All other pref changes likewise take effect
+  // on restart. All polling is paused when the tab is backgrounded
+  // (visibilityState='hidden'), so cost is only ever incurred on the
+  // foregrounded tab.
   let LIVE_MODE = true;
   let LIVE_RATE_MS = 2000;
   let LIVE_SMOOTH_MS = 1000;
   let LIVE_ALWAYS_ON = false;
   let LIVE_HOSTS_RAW = '';
+  let LIVE_THRESHOLD = 8;
   try {
     LIVE_MODE = Services.prefs.getBoolPref('zen.page-tint.live-mode', true);
     LIVE_RATE_MS = Services.prefs.getIntPref('zen.page-tint.live-mode-rate-ms', 2000);
     LIVE_SMOOTH_MS = Services.prefs.getIntPref('zen.page-tint.live-mode-smoothing-ms', 1000);
     LIVE_ALWAYS_ON = Services.prefs.getBoolPref('zen.page-tint.live-mode-always-on', false);
     LIVE_HOSTS_RAW = Services.prefs.getStringPref('zen.page-tint.live-mode-hosts', '');
+    LIVE_THRESHOLD = Services.prefs.getIntPref('zen.page-tint.live-mode-threshold', 8);
   } catch {}
 
   // Parse and normalize the allowlist once at init. Supports exact-host and
   // leading-wildcard patterns ('*.example.com' matches 'foo.example.com' but
   // not 'example.com' — explicit, matches how host suffix matching is usually
-  // documented to behave).
+  // documented to behave). Matched against URL.hostname (port excluded), so
+  // entries are port-independent: 'localhost' matches 'localhost:3000', and
+  // 'example.com' matches 'example.com:8443'. Local dev on a non-default port
+  // is the common case, so this must not require the port to be spelled out.
   const LIVE_HOSTS = LIVE_HOSTS_RAW
     .split(',')
     .map((s) => s.trim().toLowerCase())
@@ -73,7 +92,7 @@
   function hostInLiveAllowlist(url) {
     if (LIVE_HOSTS.length === 0) return false;
     try {
-      const host = new URL(url).host.toLowerCase();
+      const host = new URL(url).hostname.toLowerCase();
       for (const pattern of LIVE_HOSTS) {
         if (pattern.startsWith('*.')) {
           if (host.endsWith(pattern.slice(1))) return true;
@@ -85,15 +104,15 @@
     return false;
   }
 
-  // Unconditional one-shot log so users can verify their pref actually got read
-  // without enabling the broader DEBUG flag. Cheap (single line per window load).
-  try {
-    console.log('[zen-page-tint] live-mode pref =', LIVE_MODE,
-      '| rate =', LIVE_RATE_MS, 'ms',
-      '| smoothing =', LIVE_SMOOTH_MS, 'ms',
-      '| always-on =', LIVE_ALWAYS_ON,
-      '| allowlist =', LIVE_HOSTS.length ? LIVE_HOSTS.join(', ') : '(none)');
-  } catch {}
+  // One-shot diagnostic so a user who enabled DEBUG can confirm their prefs were
+  // actually read. Routed through the DEBUG-gated logger so it stays silent by
+  // default (was previously an unconditional console.log on every window load).
+  log('live-mode pref =', LIVE_MODE,
+    '| rate =', LIVE_RATE_MS, 'ms',
+    '| smoothing =', LIVE_SMOOTH_MS, 'ms',
+    '| threshold =', LIVE_THRESHOLD,
+    '| always-on =', LIVE_ALWAYS_ON,
+    '| allowlist =', LIVE_HOSTS.length ? LIVE_HOSTS.join(', ') : '(none)');
 
   const MESSAGE_NAME = 'zen-page-tint:theme';
   const CONFIG_MESSAGE_NAME = 'zen-page-tint:config';
@@ -102,10 +121,22 @@
 
   // Smoothing transitions are always armed (used on every theme change,
   // including tab-switch cache hits and event-driven samples), so the
-  // smoothing CSS variable is set unconditionally. The zen-page-tint-live
-  // attribute is still useful as a marker that live polling is engaged —
-  // not gating the transition itself.
+  // smoothing CSS variable is set unconditionally.
   root.style.setProperty('--zpt-live-smoothing-ms', `${LIVE_SMOOTH_MS}ms`);
+
+  // Persistent "mod is active in this window" marker. The smoothing transitions
+  // are armed against THIS attribute rather than zen-page-tint, because it has
+  // to outlive the per-page tint: when we leave a tinted page for about:/chrome:
+  // we remove zen-page-tint AND the tint variable in the same restyle. If the
+  // transition were scoped to zen-page-tint it would vanish at the exact moment
+  // the color reverts, so the chrome would snap back to default instead of
+  // fading. Scoping the transition to a marker that persists keeps a transition
+  // in effect across the clear. Removed only on cleanup, so no transitions
+  // apply once the mod is torn down.
+  root.setAttribute('zen-page-tint-active', 'on');
+
+  // zen-page-tint-live marks that live polling is engaged (diagnostic / future
+  // styling hook). Not used to gate smoothing — smoothing is always-on.
   if (LIVE_MODE) {
     root.setAttribute('zen-page-tint-live', 'on');
   }
@@ -237,6 +268,8 @@
           mm.sendAsyncMessage(CONFIG_MESSAGE_NAME, {
             liveRateMs: LIVE_RATE_MS,
             alwaysOn,
+            threshold: LIVE_THRESHOLD,
+            debug: DEBUG,
           });
         } catch (e) {
           log('config message send failed', e);
@@ -396,6 +429,10 @@
       }
     } catch {}
     applyTheme(null);
+    // Drop the persistent markers so no smoothing transitions linger on chrome
+    // elements after the mod is unloaded / hot-reloaded.
+    root.removeAttribute('zen-page-tint-active');
+    root.removeAttribute('zen-page-tint-live');
   };
   if (typeof addUnloadListener === 'function') {
     addUnloadListener(cleanup);

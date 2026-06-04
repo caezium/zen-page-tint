@@ -40,8 +40,26 @@
     const PIXEL_SAMPLE_FRACTION = 0.6;
     const PIXEL_SAMPLE_GRID = 16;
     let lastBg = null;
-    let debounceTimer = null;
     let lastRescheduleAt = 0;
+
+    // Shared trailing-debounce factory. Coalesces a burst of triggers into a
+    // single delayed call: the first call arms a timer, further calls within the
+    // window are ignored, and when the timer fires the callback runs once. Both
+    // the theme sampler (DOM-mutation driven) and the live-mode video re-check
+    // need exactly these semantics, so they route through this one helper rather
+    // than each maintaining its own duplicate timer.
+    function debounce(fn, ms) {
+      let timer = null;
+      return () => {
+        if (timer) return;
+        timer = content.setTimeout(() => {
+          timer = null;
+          fn();
+        }, ms);
+      };
+    }
+    const VIDEO_CHECK_DEBOUNCE_MS = 250;
+    const SAMPLE_DEBOUNCE_MS = 250;
 
     // ---- Canvas (shared for pixel sampling AND color normalization) ----
     // Lazy-init: only created on first need. Sized to PIXEL_SAMPLE_GRID square.
@@ -261,16 +279,55 @@
       }
     }
 
+    // Parse our own canonical `rgb(r, g, b)` strings back to a triplet. Only
+    // ever fed strings we generated, so a loose numeric match is sufficient.
+    function parseRgbTriplet(s) {
+      if (typeof s !== 'string') return null;
+      const m = s.match(/(\d+)\D+(\d+)\D+(\d+)/);
+      return m ? { r: +m[1], g: +m[2], b: +m[3] } : null;
+    }
+
+    // Max absolute per-channel difference between two colors (0–255), or null
+    // if either is unparseable. Cheap and intuitive to tune: it's the largest
+    // single-channel jump, so a threshold of N means "ignore changes where no
+    // channel moved by more than N."
+    function maxChannelDelta(a, b) {
+      const pa = parseRgbTriplet(a);
+      const pb = parseRgbTriplet(b);
+      if (!pa || !pb) return null;
+      return Math.max(
+        Math.abs(pa.r - pb.r),
+        Math.abs(pa.g - pb.g),
+        Math.abs(pa.b - pb.b)
+      );
+    }
+
+    // Decide whether a freshly-read color is different *enough* from the last
+    // one we sent to be worth applying. Identical strings are never sent;
+    // appearing/clearing the tint (null on either side) always is; below the
+    // live threshold is suppressed so imperceptible jitter doesn't churn the
+    // chrome (continuous IPC + a 1s CSS fade on the big tab-strip surfaces).
+    // A threshold of 0 reproduces the old exact-match behavior.
+    function significantChange(newBg) {
+      if (newBg === lastBg) return false;
+      if (lastBg === null || newBg === null) return true;
+      if (liveThreshold <= 0) return true;
+      const d = maxChannelDelta(newBg, lastBg);
+      return d === null ? true : d >= liveThreshold;
+    }
+
+    // Returns true iff it actually sent an update (used by the adaptive poller
+    // to decide whether to stay at the fast rate or back off).
     function sample(force) {
       const r = read();
-      if (force || r.bg !== lastBg) {
-        lastBg = r.bg;
-        sendAsyncMessage(MESSAGE_NAME, {
-          bg: r.bg,
-          source: r.source,
-          href: content.location && content.location.href,
-        });
-      }
+      if (!(force || significantChange(r.bg))) return false;
+      lastBg = r.bg;
+      sendAsyncMessage(MESSAGE_NAME, {
+        bg: r.bg,
+        source: r.source,
+        href: content.location && content.location.href,
+      });
+      return true;
     }
     content.__zen_page_tint_sample = sample;
 
@@ -286,29 +343,84 @@
     //     one <video> element on the page is actually playing. Static pages
     //     (text, no video) cost nothing — no polling at all.
     //
-    // Video state is tracked via play/pause/ended/emptied events captured at
-    // the document level (bubbles from any <video>) plus a debounced
-    // MutationObserver to catch dynamically-inserted players (YouTube SPA
-    // navigation, ad inserts, lazy-mounted carousels).
+    // Video state is tracked purely via play/playing/pause/ended/emptied events
+    // captured at the document level (they bubble from any <video>, including
+    // dynamically-inserted players — YouTube SPA navigation, ad inserts,
+    // lazy-mounted carousels — the moment they start playing). See
+    // wireVideoDetection() for why there is deliberately no whole-document
+    // MutationObserver here, and for the cross-origin <iframe> embed limitation.
+    //
+    // Adaptive rate: there's no event that fires when a video's *color* changes,
+    // so we have to sample to find out — but we don't have to sample at a flat
+    // rate. We poll fast (the "active" rate, liveRateMs / DIVISOR floored at
+    // LIVE_RATE_FLOOR_MS) while the color keeps changing significantly, and after
+    // a few stable ticks we back off to liveRateMs (the idle ceiling). Any
+    // significant change snaps us straight back to the active rate. Combined with
+    // the apply-threshold (significantChange), this means a busy scene is
+    // followed responsively while a static frame (paused-looking video, talking
+    // head, letterboxed still) costs little — without ever fully stopping while
+    // the video plays.
     const CONFIG_MESSAGE_NAME = 'zen-page-tint:config';
+    const LIVE_RATE_FLOOR_MS = 250;       // never sample faster than this (4 Hz)
+    const LIVE_ACTIVE_DIVISOR = 4;        // active rate = idle rate / this
+    const LIVE_STABLE_TICKS_TO_IDLE = 4;  // unchanged ticks before backing off
     let liveTimer = null;
-    let liveRateMs = 0;
+    let liveRateMs = 0;                   // idle/ceiling rate (the pref value)
+    let liveActiveRateMs = 0;             // fast rate while colors are changing
+    let liveStableTicks = 0;              // consecutive no-significant-change ticks
+    let liveThreshold = 0;                // apply threshold (max per-channel delta)
     let liveAlwaysOn = false;
     let liveVideoIsPlaying = false;
     let liveVisibilityWired = false;
     let liveVideoListenersWired = false;
-    let liveVideoObserver = null;
-    let liveVideoCheckTimer = null;
 
-    function updatePollingState() {
-      const shouldPoll = liveRateMs > 0
-        && content.document.visibilityState === 'visible'
+    function shouldPollNow() {
+      // content.document can be null during content-process / document teardown
+      // (tab discard, navigation). Reaching this from the visibilitychange
+      // handler — whose body isn't try/catch-wrapped — an unguarded deref would
+      // surface an uncaught TypeError to the Browser Console. A missing document
+      // means not-pollable.
+      const doc = content.document;
+      return !!doc
+        && liveRateMs > 0
+        && doc.visibilityState === 'visible'
         && (liveAlwaysOn || liveVideoIsPlaying);
-      if (shouldPoll && !liveTimer) {
-        liveTimer = content.setInterval(() => sample(false), liveRateMs);
-      } else if (!shouldPoll && liveTimer) {
-        try { content.clearInterval(liveTimer); } catch {}
+    }
+
+    function stopPolling() {
+      if (liveTimer) {
+        try { content.clearTimeout(liveTimer); } catch {}
         liveTimer = null;
+      }
+    }
+
+    function scheduleNextPoll() {
+      const rate = liveStableTicks >= LIVE_STABLE_TICKS_TO_IDLE
+        ? liveRateMs
+        : liveActiveRateMs;
+      liveTimer = content.setTimeout(livePollTick, rate);
+    }
+
+    function livePollTick() {
+      liveTimer = null;
+      if (!shouldPollNow()) return; // stop the loop if we're no longer pollable
+      const applied = sample(false);
+      if (applied) liveStableTicks = 0;
+      else liveStableTicks++;
+      scheduleNextPoll();
+    }
+
+    // Start/stop the adaptive poll loop based on the current state. Event-driven
+    // callers (visibilitychange, video play/pause) invoke this to (re)evaluate;
+    // the loop itself reschedules via livePollTick while shouldPollNow() holds.
+    function updatePollingState() {
+      if (shouldPollNow()) {
+        if (!liveTimer) {
+          liveStableTicks = 0; // (re)start responsive
+          scheduleNextPoll();
+        }
+      } else {
+        stopPolling();
       }
     }
 
@@ -338,13 +450,7 @@
       }
     }
 
-    function scheduleVideoCheck() {
-      if (liveVideoCheckTimer) return;
-      liveVideoCheckTimer = content.setTimeout(() => {
-        liveVideoCheckTimer = null;
-        checkVideoState();
-      }, 250);
-    }
+    const scheduleVideoCheck = debounce(checkVideoState, VIDEO_CHECK_DEBOUNCE_MS);
 
     function wireVideoDetection() {
       if (liveVideoListenersWired) {
@@ -357,19 +463,27 @@
       liveVideoListenersWired = true;
       const doc = content.document;
       // Capture-phase listeners on the document so we get events from any
-      // <video> regardless of where it's mounted in the tree.
+      // <video> regardless of where it's mounted in the tree. These also cover
+      // dynamically-inserted players (YouTube SPA nav, ad inserts, lazy-mounted
+      // carousels): a late-mounted <video> that starts playing fires
+      // play/playing, which we catch here and which re-runs checkVideoState.
+      // That's why we do NOT run a whole-document childList+subtree
+      // MutationObserver for video detection — it fired on every DOM mutation on
+      // heavy SPAs (the pages that mutate most) purely to notice an insertion the
+      // media events already surface, and duplicated observer infrastructure the
+      // script maintains elsewhere.
+      //
+      // LIMITATION: a <video> inside a cross-origin <iframe> (the common
+      // YouTube/Vimeo/Spotify embed on a third-party page) lives in a separate
+      // browsing context. Its media events don't cross the iframe boundary and
+      // we can't enumerate it, so auto-detect never sees it. The pixel sampler
+      // WOULD tint it correctly if polling ran — only the trigger is missing.
+      // Supported workaround: add the host to zen.page-tint.live-mode-hosts to
+      // force always-on polling for embed-heavy sites.
       const events = ['play', 'playing', 'pause', 'ended', 'emptied', 'abort'];
       for (const ev of events) {
         try { doc.addEventListener(ev, scheduleVideoCheck, { capture: true }); } catch {}
       }
-      // Catch dynamically-inserted <video> nodes (YouTube SPA nav, etc.).
-      try {
-        liveVideoObserver = new content.MutationObserver(scheduleVideoCheck);
-        liveVideoObserver.observe(doc.body || doc.documentElement, {
-          childList: true,
-          subtree: true,
-        });
-      } catch {}
       checkVideoState();
     }
 
@@ -390,24 +504,31 @@
       } catch {}
     }
 
-    function configureLiveMode(rateMs, alwaysOn) {
+    function configureLiveMode(rateMs, alwaysOn, threshold) {
       // Reconfigured on every config message — chrome sends one after each
       // loadFrameScript, which means every TabSelect cache-miss and every
       // top-level navigation. Cheap because listeners/observers only attach
       // once (guarded by the *Wired flags).
+      //
+      // A non-positive rate is the in-band "don't poll" state (e.g. the user set
+      // zen.page-tint.live-mode-rate-ms to 0): liveRateMs becomes 0, no video
+      // detection is wired, and updatePollingState() stops any running timer.
+      // This is the only disable path — there's no separate teardown function,
+      // because the master-switch-off case is expressed chrome-side as "send no
+      // config message at all" (which requires a restart to change), never as a
+      // runtime disable message reaching here.
       liveRateMs = rateMs > 0 ? rateMs : 0;
+      // Active (fast) rate while colors are actively changing: a fraction of the
+      // idle rate, floored so we never sample faster than LIVE_RATE_FLOOR_MS.
+      liveActiveRateMs = liveRateMs > 0
+        ? Math.max(LIVE_RATE_FLOOR_MS, (liveRateMs / LIVE_ACTIVE_DIVISOR) | 0)
+        : 0;
+      liveThreshold = threshold > 0 ? threshold : 0;
       liveAlwaysOn = !!alwaysOn;
       wireVisibilityListener();
       if (!liveAlwaysOn && liveRateMs > 0) {
         wireVideoDetection();
       }
-      updatePollingState();
-    }
-
-    function disableLiveMode() {
-      liveRateMs = 0;
-      liveAlwaysOn = false;
-      liveVideoIsPlaying = false;
       updatePollingState();
     }
 
@@ -420,12 +541,19 @@
       receiveMessage(msg) {
         try {
           const data = msg?.data || {};
-          try {
-            console.log('[zen-page-tint frame] config received, rate =', data.liveRateMs,
-              '| alwaysOn =', !!data.alwaysOn);
-          } catch {}
-          if (data.liveRateMs > 0) configureLiveMode(data.liveRateMs, data.alwaysOn);
-          else disableLiveMode();
+          // Gated on the chrome-side DEBUG pref (passed through in the config
+          // payload) so this stays silent by default — this listener fires on
+          // every config message, i.e. every cache-miss tab select and every
+          // navigation, so an ungated log here is steady console noise.
+          if (data.debug) {
+            try {
+              console.log('[zen-page-tint frame] config received, rate =', data.liveRateMs,
+                '| alwaysOn =', !!data.alwaysOn, '| threshold =', data.threshold);
+            } catch {}
+          }
+          // Single path: configureLiveMode treats a non-positive rate as "don't
+          // poll", so it covers both enable and the pref-rate-0 disable case.
+          configureLiveMode(data.liveRateMs, data.alwaysOn, data.threshold);
         } catch (e) {
           try { console.error('[zen-page-tint frame] config handler error:', e); } catch {}
         }
@@ -437,13 +565,7 @@
       try { console.error('[zen-page-tint frame] addMessageListener failed:', e); } catch {}
     }
 
-    function debouncedSample() {
-      if (debounceTimer) return;
-      debounceTimer = content.setTimeout(() => {
-        debounceTimer = null;
-        sample(false);
-      }, 250);
-    }
+    const debouncedSample = debounce(() => sample(false), SAMPLE_DEBOUNCE_MS);
 
     // Initial sample — wait for DOMContentLoaded if doc is still loading, so we don't
     // read a half-rendered loading screen (e.g., Gmail's white pre-bootstrap state).
