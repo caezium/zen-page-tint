@@ -237,28 +237,29 @@
   }
 }
 
-/* ---------- Live mode smoothing (opt-in via zen.page-tint.live-mode) ----------
+/* ---------- Color-change smoothing ----------
  *
- * Live mode polls the page color several times per second (default ~3 fps to
- * match the YouTube Shorts ambient-glow feel). Without smoothing this would
- * read as visible color steps; with a transition slightly longer than the
- * polling interval the eye sees a continuous slide between samples.
+ * Smoothing transitions apply on every tint update — tab-switch cache hits,
+ * event-driven samples (MutationObserver / load), AND live-mode polling
+ * ticks. The user perceives chrome color sliding continuously between page
+ * colors instead of snapping. Duration is set by JS via the
+ * --zpt-live-smoothing-ms CSS variable (default 1000ms).
  *
- * Scoped strictly to :root[zen-page-tint-live="on"] so default users get the
- * snap-color behavior they're used to. The transition duration is set by JS
- * via --zpt-live-smoothing-ms (default 400ms). Transitions are NOT applied to
- * any .tabbrowser-tab elements — those are still color-snapped to avoid the
- * paint cascade at high tab counts.
+ * Scoped to :root[zen-page-tint="on"] so transitions don't apply on
+ * about:/chrome: pages where we clear the tint entirely.
+ *
+ * NOT applied to .tabbrowser-tab elements: those stay color-snapped to avoid
+ * the multi-thousand-element paint cascade at high tab counts. The original
+ * blended-addressbar / blended-sidebar approach had this same trap; we keep
+ * the chrome-surface-only transition set so it remains cheap.
  */
-:root[zen-page-tint-live="on"] {
-  #zen-appcontent-navbar-wrapper {
-    transition: background-color var(--zpt-live-smoothing-ms, 400ms) ease-out,
-                color var(--zpt-live-smoothing-ms, 400ms) ease-out !important;
-  }
+:root[zen-page-tint="on"] #zen-appcontent-navbar-wrapper {
+  transition: background-color var(--zpt-live-smoothing-ms, 1000ms) ease-out,
+              color var(--zpt-live-smoothing-ms, 1000ms) ease-out !important;
 }
 
 @layer zen-page-tint {
-  :root[zen-page-tint-live="on"][zen-page-tint="on"] {
+  :root[zen-page-tint="on"] {
     #zen-browser-background::before,
     #zen-browser-background::after,
     #main-window,
@@ -276,9 +277,9 @@
     .zen-workspace-tabs-section,
     #zen-sidebar-splitter,
     #sidebar-splitter {
-      transition: background-color var(--zpt-live-smoothing-ms, 400ms) ease-out,
-                  color var(--zpt-live-smoothing-ms, 400ms) ease-out,
-                  box-shadow var(--zpt-live-smoothing-ms, 400ms) ease-out !important;
+      transition: background-color var(--zpt-live-smoothing-ms, 1000ms) ease-out,
+                  color var(--zpt-live-smoothing-ms, 1000ms) ease-out,
+                  box-shadow var(--zpt-live-smoothing-ms, 1000ms) ease-out !important;
     }
   }
 }

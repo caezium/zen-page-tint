@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Zen Page Tint
 // @description    Adaptive Zen chrome color from the active page
-// @version        1.0.6
+// @version        1.0.7
 // ==/UserScript==
 
 (() => {
@@ -42,15 +42,21 @@
   // Pref changes require a Zen restart to take effect. All polling is paused
   // when the tab is backgrounded (visibilityState='hidden') so cost is only
   // ever incurred on the foregrounded tab.
-  let LIVE_MODE = false;
-  let LIVE_RATE_MS = 300;
-  let LIVE_SMOOTH_MS = 400;
+  // Defaults: live-mode on (auto-detected against <video>, so static sites
+  // cost zero), 2 Hz poll rate, 1000ms smoothing transition. The slower poll
+  // is plausible because the smoothing transition interpolates between
+  // samples — the eye sees continuous color motion even when we sample at
+  // 0.5x/sec. Tab-switch fades use the same transition, so chrome color
+  // slides smoothly when revisiting cached tabs too.
+  let LIVE_MODE = true;
+  let LIVE_RATE_MS = 2000;
+  let LIVE_SMOOTH_MS = 1000;
   let LIVE_ALWAYS_ON = false;
   let LIVE_HOSTS_RAW = '';
   try {
-    LIVE_MODE = Services.prefs.getBoolPref('zen.page-tint.live-mode', false);
-    LIVE_RATE_MS = Services.prefs.getIntPref('zen.page-tint.live-mode-rate-ms', 300);
-    LIVE_SMOOTH_MS = Services.prefs.getIntPref('zen.page-tint.live-mode-smoothing-ms', 400);
+    LIVE_MODE = Services.prefs.getBoolPref('zen.page-tint.live-mode', true);
+    LIVE_RATE_MS = Services.prefs.getIntPref('zen.page-tint.live-mode-rate-ms', 2000);
+    LIVE_SMOOTH_MS = Services.prefs.getIntPref('zen.page-tint.live-mode-smoothing-ms', 1000);
     LIVE_ALWAYS_ON = Services.prefs.getBoolPref('zen.page-tint.live-mode-always-on', false);
     LIVE_HOSTS_RAW = Services.prefs.getStringPref('zen.page-tint.live-mode-hosts', '');
   } catch {}
@@ -94,11 +100,14 @@
   const FRAME_SCRIPT_URL = 'chrome://sine/content/zen-page-tint/frame.js';
   const root = document.documentElement;
 
-  // Flag the root so the stylesheet can scope the smoothing transitions to
-  // live mode only. Off-by-default users keep the snap-color behavior they had.
+  // Smoothing transitions are always armed (used on every theme change,
+  // including tab-switch cache hits and event-driven samples), so the
+  // smoothing CSS variable is set unconditionally. The zen-page-tint-live
+  // attribute is still useful as a marker that live polling is engaged —
+  // not gating the transition itself.
+  root.style.setProperty('--zpt-live-smoothing-ms', `${LIVE_SMOOTH_MS}ms`);
   if (LIVE_MODE) {
     root.setAttribute('zen-page-tint-live', 'on');
-    root.style.setProperty('--zpt-live-smoothing-ms', `${LIVE_SMOOTH_MS}ms`);
   }
 
   // Cache: origin+path → bg string (canonical rgb()). Bounded LRU (true access-order).
