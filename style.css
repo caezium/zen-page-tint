@@ -248,10 +248,20 @@
  * Scoped to :root[zen-page-tint="on"] so transitions don't apply on
  * about:/chrome: pages where we clear the tint entirely.
  *
- * NOT applied to .tabbrowser-tab elements: those stay color-snapped to avoid
- * the multi-thousand-element paint cascade at high tab counts. The original
- * blended-addressbar / blended-sidebar approach had this same trap; we keep
- * the chrome-surface-only transition set so it remains cheap.
+ * IMPORTANT: containers like #navigator-toolbox / #titlebar /
+ * .zen-workspace-tabs-section contain the tab strip (1000+ tabs at scale).
+ * Putting `color` in the transition on those parents causes every descendant
+ * that inherits `color` (.tabbrowser-tab, .tab-content, .tab-label) to
+ * visually animate with the parent — thousands of elements interpolating
+ * across the 1s transition saturates the compositor and lags the sidebar.
+ *
+ * So we split:
+ *   - URL bar wrapper transitions BOTH bg + color (no tab descendants → safe)
+ *   - Tab-strip-containing surfaces transition ONLY bg + box-shadow; color
+ *     snaps on those (still ends up at the right value via the !important
+ *     color rules below — just no animated propagation).
+ *   - .tabbrowser-tab elements get explicit transition:none belt-and-suspenders
+ *     to suppress any inherited transition behavior that might still creep in.
  */
 :root[zen-page-tint="on"] #zen-appcontent-navbar-wrapper {
   transition: background-color var(--zpt-live-smoothing-ms, 1000ms) ease-out,
@@ -277,9 +287,19 @@
     .zen-workspace-tabs-section,
     #zen-sidebar-splitter,
     #sidebar-splitter {
+      /* bg + shadow only — see comment above for why color is excluded */
       transition: background-color var(--zpt-live-smoothing-ms, 1000ms) ease-out,
-                  color var(--zpt-live-smoothing-ms, 1000ms) ease-out,
                   box-shadow var(--zpt-live-smoothing-ms, 1000ms) ease-out !important;
+    }
+
+    /* Belt-and-suspenders: explicitly suppress any transition on tab elements
+       so inherited color values land instantly instead of animating across
+       the whole strip. */
+    .tabbrowser-tab,
+    .tabbrowser-tab .tab-content,
+    .tabbrowser-tab .tab-label,
+    .tabbrowser-tab .tab-icon-image {
+      transition: none !important;
     }
   }
 }
