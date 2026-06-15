@@ -7,13 +7,17 @@
 (() => {
   'use strict';
 
+  // Each pref is read independently: Services.prefs.get*Pref throws on a
+  // wrong-TYPE pref (the default arg only covers the missing case), so sharing one
+  // try block would let a single mistyped about:config entry silently revert every
+  // later pref to its default.
+  function prefBool(name, def) { try { return Services.prefs.getBoolPref(name, def); } catch { return def; } }
+  function prefInt(name, def) { try { return Services.prefs.getIntPref(name, def); } catch { return def; } }
+  function prefStr(name, def) { try { return Services.prefs.getStringPref(name, def); } catch { return def; } }
+
   // DEBUG is read from a pref so it can be toggled at runtime via about:config
-  // (zen.page-tint.debug = true). Defaults to false. Falls back to false if Services
-  // isn't available for any reason.
-  let DEBUG = false;
-  try {
-    DEBUG = Services.prefs.getBoolPref('zen.page-tint.debug', false);
-  } catch (e) {}
+  // (zen.page-tint.debug = true). Defaults to false.
+  const DEBUG = prefBool('zen.page-tint.debug', false);
   const log = DEBUG ? (...args) => console.log('[zen-page-tint]', ...args) : () => {};
 
   // Live mode — optional continuous polling that lets the chrome tint follow
@@ -25,88 +29,45 @@
   //   zen.page-tint.live-mode-rate-ms       (int, default 2000 — 0.5 Hz)
   //     The IDLE/ceiling poll interval. Sampling is adaptive: while the page
   //     color is actively changing we poll faster (down to rate/4, floored at
-  //     250ms / 4 Hz) so scene changes are followed responsively, then back off
-  //     to this rate once the color is stable. A static frame costs ~this rate;
-  //     a busy video samples up to 4x faster. The smoothing transition still
-  //     interpolates between samples either way.
+  //     250ms / 4 Hz), then back off to this rate once the color is stable.
   //   zen.page-tint.live-mode-threshold     (int, default 8 — 0..255)
-  //     Minimum per-channel color change required to actually re-tint the
-  //     chrome during live polling. Imperceptible frame-to-frame jitter below
-  //     this is ignored, so the chrome doesn't churn (continuous IPC + a 1s
-  //     fade on the big tab-strip surfaces) on near-static scenes. It also
-  //     drives the adaptive backoff above — sub-threshold ticks count as
-  //     "stable". Set 0 to re-tint on any change at all (the old behavior).
-  //   zen.page-tint.live-mode-smoothing-ms  (int, default 1000 — CSS transition
-  //                                         duration applied to EVERY tint change,
-  //                                         live or event-driven; tab-switch
-  //                                         cache hits fade with this too)
+  //     Minimum per-channel color change required to actually re-tint. Below this
+  //     is ignored so the chrome doesn't churn. Set 0 to re-tint on any change.
+  //   zen.page-tint.live-mode-smoothing-ms  (int, default 1000)
+  //     CSS transition duration applied to EVERY tint change, live or event-driven.
   //   zen.page-tint.live-mode-always-on     (bool, default false)
-  //     When false (default), live polling only runs while a <video> element
-  //     on the page is actually playing. Static pages (text, images) cost
-  //     nothing because no video → no polling. Set true to force polling on
-  //     every foregrounded page regardless of video state.
+  //     When false, live polling only runs while a <video> is actually playing.
   //   zen.page-tint.live-mode-hosts         (string, default '')
-  //     Comma-separated host allowlist. Sites matching any pattern are treated
-  //     as always-on regardless of video state. This is the supported
-  //     workaround for players auto-detect can't see: canvas/WebGL players and
-  //     cross-origin <iframe> video embeds (YouTube/Vimeo/Spotify embedded on a
-  //     third-party page — their <video> lives in a separate browsing context,
-  //     so its media events never reach this document). Matched by hostname, so
-  //     entries are port-independent. Examples:
+  //     Comma-separated host allowlist treated as always-on (canvas/WebGL players,
+  //     cross-origin <iframe> video embeds). Matched by hostname, port-independent.
   //       example.com, *.spotify.com, music.apple.com, localhost
   //
-  // Disabling live mode (master switch off) requires a Zen restart: config is
-  // pushed to content only at frame-script load time, and the off state is
-  // expressed as "send no config" rather than a runtime teardown message — so
-  // there's no live disable path. All other pref changes likewise take effect
-  // on restart. All polling is paused when the tab is backgrounded
-  // (visibilityState='hidden'), so cost is only ever incurred on the
-  // foregrounded tab.
-  let LIVE_MODE = true;
-  let LIVE_RATE_MS = 2000;
-  let LIVE_SMOOTH_MS = 1000;
-  let LIVE_ALWAYS_ON = false;
-  let LIVE_HOSTS_RAW = '';
-  let LIVE_THRESHOLD = 8;
-  try {
-    LIVE_MODE = Services.prefs.getBoolPref('zen.page-tint.live-mode', true);
-    LIVE_RATE_MS = Services.prefs.getIntPref('zen.page-tint.live-mode-rate-ms', 2000);
-    LIVE_SMOOTH_MS = Services.prefs.getIntPref('zen.page-tint.live-mode-smoothing-ms', 1000);
-    LIVE_ALWAYS_ON = Services.prefs.getBoolPref('zen.page-tint.live-mode-always-on', false);
-    LIVE_HOSTS_RAW = Services.prefs.getStringPref('zen.page-tint.live-mode-hosts', '');
-    LIVE_THRESHOLD = Services.prefs.getIntPref('zen.page-tint.live-mode-threshold', 8);
-  } catch {}
+  // Disabling the master switch requires a Zen restart (config is pushed only at
+  // frame-script load time). All polling is paused when the tab is backgrounded.
+  const LIVE_MODE = prefBool('zen.page-tint.live-mode', true);
+  const LIVE_RATE_MS = prefInt('zen.page-tint.live-mode-rate-ms', 2000);
+  const LIVE_SMOOTH_MS = prefInt('zen.page-tint.live-mode-smoothing-ms', 1000);
+  const LIVE_ALWAYS_ON = prefBool('zen.page-tint.live-mode-always-on', false);
+  const LIVE_HOSTS_RAW = prefStr('zen.page-tint.live-mode-hosts', '');
+  const LIVE_THRESHOLD = prefInt('zen.page-tint.live-mode-threshold', 8);
 
-  // Parse and normalize the allowlist once at init. Supports exact-host and
-  // leading-wildcard patterns ('*.example.com' matches 'foo.example.com' but
-  // not 'example.com' — explicit, matches how host suffix matching is usually
-  // documented to behave). Matched against URL.hostname (port excluded), so
-  // entries are port-independent: 'localhost' matches 'localhost:3000', and
-  // 'example.com' matches 'example.com:8443'. Local dev on a non-default port
-  // is the common case, so this must not require the port to be spelled out.
-  const LIVE_HOSTS = LIVE_HOSTS_RAW
-    .split(',')
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
+  // Parse the allowlist once. Supports exact-host and leading-wildcard patterns
+  // ('*.example.com' matches 'foo.example.com' but not 'example.com'). Matched
+  // against URL.hostname, so entries are port-independent.
+  const LIVE_HOSTS = LIVE_HOSTS_RAW.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 
   function hostInLiveAllowlist(url) {
     if (LIVE_HOSTS.length === 0) return false;
     try {
       const host = new URL(url).hostname.toLowerCase();
       for (const pattern of LIVE_HOSTS) {
-        if (pattern.startsWith('*.')) {
-          if (host.endsWith(pattern.slice(1))) return true;
-        } else if (host === pattern) {
-          return true;
-        }
+        if (pattern.startsWith('*.')) { if (host.endsWith(pattern.slice(1))) return true; }
+        else if (host === pattern) return true;
       }
     } catch {}
     return false;
   }
 
-  // One-shot diagnostic so a user who enabled DEBUG can confirm their prefs were
-  // actually read. Routed through the DEBUG-gated logger so it stays silent by
-  // default (was previously an unconditional console.log on every window load).
   log('live-mode pref =', LIVE_MODE,
     '| rate =', LIVE_RATE_MS, 'ms',
     '| smoothing =', LIVE_SMOOTH_MS, 'ms',
@@ -116,46 +77,32 @@
 
   const MESSAGE_NAME = 'zen-page-tint:theme';
   const CONFIG_MESSAGE_NAME = 'zen-page-tint:config';
+  const TEARDOWN_MESSAGE_NAME = 'zen-page-tint:teardown';
   const FRAME_SCRIPT_URL = 'chrome://sine/content/zen-page-tint/frame.js';
   const root = document.documentElement;
 
-  // Smoothing transitions are always armed (used on every theme change,
-  // including tab-switch cache hits and event-driven samples), so the
-  // smoothing CSS variable is set unconditionally.
+  // Smoothing transitions are always armed, so the smoothing variable is set
+  // unconditionally.
   root.style.setProperty('--zpt-live-smoothing-ms', `${LIVE_SMOOTH_MS}ms`);
 
-  // Persistent "mod is active in this window" marker. The smoothing transitions
-  // are armed against THIS attribute rather than zen-page-tint, because it has
-  // to outlive the per-page tint: when we leave a tinted page for about:/chrome:
-  // we remove zen-page-tint AND the tint variable in the same restyle. If the
-  // transition were scoped to zen-page-tint it would vanish at the exact moment
-  // the color reverts, so the chrome would snap back to default instead of
-  // fading. Scoping the transition to a marker that persists keeps a transition
-  // in effect across the clear. Removed only on cleanup, so no transitions
-  // apply once the mod is torn down.
+  // Persistent "mod is active in this window" marker. Smoothing transitions are
+  // armed against THIS attribute (not zen-page-tint) so they survive leaving a
+  // tinted page for about:/chrome:. Removed only on cleanup.
   root.setAttribute('zen-page-tint-active', 'on');
+  if (LIVE_MODE) root.setAttribute('zen-page-tint-live', 'on');
 
-  // zen-page-tint-live marks that live polling is engaged (diagnostic / future
-  // styling hook). Not used to gate smoothing — smoothing is always-on.
-  if (LIVE_MODE) {
-    root.setAttribute('zen-page-tint-live', 'on');
+  function isInternalUrl(url) {
+    return !url || url.startsWith('about:') || url.startsWith('chrome:');
   }
 
   // Cache: origin+path → bg string (canonical rgb()). Bounded LRU (true access-order).
-  // We store only `bg` because `fg` is always derived deterministically via readableFg(bg).
-  // Storing fg too would double cache memory and risk drift if the contrast rule changes.
+  // Only `bg` is stored; `fg` is derived deterministically via readableFg(bg).
   const themeCache = new Map();
-  const CACHE_MAX = 500;
-
-  // Map browser → message listener fn, so we can removeMessageListener on TabClose.
-  // Acts as both the "have we attached?" check and the cleanup ref — single source of truth.
-  const browserListeners = new WeakMap();
-  // NOTE: we intentionally do NOT track "frame script loaded per browser". When Auto Tab
-  // Discard unloads + restores a tab, the content process is recreated but the browser
-  // object is the same. A "loaded once per browser" WeakSet would short-circuit re-loading
-  // and the new content process would never get the script, breaking samples on restored
-  // tabs. The frame.js init guard handles same-process double-loads cheaply, so it's safe
-  // to call loadFrameScript every time we need a fresh sample.
+  // Sized above the heavy-tab working set (the project targets 1300+ tabs). A
+  // smaller cap thrashes: cycling more distinct URLs than the cap forces most tab
+  // switches onto the slow miss path, defeating the cache. Entries are short
+  // strings (~a few hundred KB total at this size).
+  const CACHE_MAX = 3000;
 
   function parseRgb(color) {
     if (!color) return null;
@@ -163,9 +110,8 @@
     return m ? { r: +m[1], g: +m[2], b: +m[3] } : null;
   }
 
-  // Pick black or white text for max contrast against given bg (Rec 601 luminance).
-  // The frame script normalizes ALL bg values to canonical rgb() before sending, so
-  // parseRgb's narrow regex is sufficient here — no hex/HSL/named to handle.
+  // Pick black or white text for max contrast (Rec 601 luminance). The frame
+  // script normalizes ALL bg values to canonical rgb() before sending.
   function readableFg(bg) {
     const rgb = parseRgb(bg);
     if (!rgb) return null;
@@ -173,10 +119,18 @@
     return lum > 0.55 ? '#000' : '#fff';
   }
 
+  // Track the last applied color so switching between same-colored tabs (the
+  // common case — most pages are white or one of a few grays) doesn't rewrite the
+  // CSS variables and trigger a full restyle of every var() consumer (including
+  // the per-tab rules × thousands of tabs) plus a re-armed 1s fade.
+  let lastAppliedBg = undefined;
   function applyTheme(bg) {
-    if (bg) {
-      const fg = readableFg(bg) || 'inherit';
-      root.style.setProperty('--zen-tab-header-background', bg);
+    const next = bg || null;
+    if (next === lastAppliedBg) return;
+    lastAppliedBg = next;
+    if (next) {
+      const fg = readableFg(next) || 'inherit';
+      root.style.setProperty('--zen-tab-header-background', next);
       root.style.setProperty('--zen-tab-header-foreground', fg);
       root.setAttribute('zen-page-tint', 'on');
     } else {
@@ -187,200 +141,204 @@
   }
 
   function cacheKey(uri) {
-    try {
-      const u = new URL(uri);
-      return u.origin + u.pathname;
-    } catch {
-      return uri || '';
-    }
+    try { const u = new URL(uri); return u.origin + u.pathname; }
+    catch { return uri || ''; }
   }
 
-  // True LRU semantics: on access, move entry to the end of insertion order.
   function cacheGet(key) {
     const value = themeCache.get(key);
-    if (value !== undefined) {
-      themeCache.delete(key);
-      themeCache.set(key, value);
-    }
+    if (value !== undefined) { themeCache.delete(key); themeCache.set(key, value); }
     return value;
   }
 
   function cacheSet(key, value) {
-    if (themeCache.has(key)) {
-      themeCache.delete(key); // re-insert at tail
-    } else if (themeCache.size >= CACHE_MAX) {
-      // Evict least-recently-used (head of insertion order).
-      themeCache.delete(themeCache.keys().next().value);
-    }
+    if (themeCache.has(key)) themeCache.delete(key);
+    else if (themeCache.size >= CACHE_MAX) themeCache.delete(themeCache.keys().next().value);
     themeCache.set(key, value);
   }
 
-  // Add the persistent chrome-side message listener for a browser. Idempotent.
-  function attachListener(browser) {
-    if (!browser || browserListeners.has(browser)) return;
-    const mm = browser.messageManager;
-    if (!mm?.addMessageListener) return;
+  // Per-browser record: { mm, listener, loaded }. Keyed by browser element (weak),
+  // but we track the messageManager identity too: a discarded/restored tab,
+  // remoteness change, or tab tear-off recreates the mm, and the listener must be
+  // re-attached to the live one (the old "have we attached?" boolean guard left
+  // restored tabs with no listener at all).
+  const browserState = new WeakMap();
 
-    const listener = (msg) => {
-      const url = browser.currentURI?.spec || '';
-      if (!url || url.startsWith('about:') || url.startsWith('chrome:')) return;
-      const key = cacheKey(url);
+  function makeListener(browser) {
+    return (msg) => {
       const theme = msg.data || {};
-      log('message received', { source: theme.source, bg: theme.bg, url: theme.href || url });
-      if (!theme.bg) return;
-      cacheSet(key, theme.bg);
-      if (gBrowser.selectedBrowser === browser) {
-        applyTheme(theme.bg);
-        log('applied', { bg: theme.bg });
+      const current = browser.currentURI?.spec || '';
+      // Key by the URL the sample was actually taken from (sent as href), not the
+      // browser's current URI — an in-flight sample from the previous document can
+      // arrive after navigation, and must not be cached/applied under the new URL.
+      const sampled = theme.href || current;
+      if (isInternalUrl(sampled)) return;
+      const key = cacheKey(sampled);
+      const isCurrent = cacheKey(current) === key;
+      log('message received', { source: theme.source, bg: theme.bg, url: sampled });
+
+      if (theme.bg) {
+        cacheSet(key, theme.bg);
+        if (isCurrent && gBrowser.selectedBrowser === browser) {
+          applyTheme(theme.bg);
+          log('applied', { bg: theme.bg });
+        }
+      } else if (isCurrent && gBrowser.selectedBrowser === browser) {
+        // Genuine "no color found" on the page currently shown — drop the stale
+        // cache entry and clear the tint (otherwise the previous page's tint
+        // lingers on a colorless / transparent page). Gated on selected+current so
+        // a background duplicate-URL tab's transient pre-paint null can't evict the
+        // entry a foreground tab on the same URL is relying on.
+        themeCache.delete(key);
+        applyTheme(null);
       }
     };
-
-    try {
-      mm.addMessageListener(MESSAGE_NAME, listener);
-      browserListeners.set(browser, listener);
-      log('listener attached');
-    } catch (e) {
-      log('listener attach failed', e);
-    }
   }
 
-  // Load the frame script into the browser's content process.
-  // Called only when we actually need a fresh sample (cache miss / forceFresh).
-  // Safe to call repeatedly: the frame.js init guard short-circuits when the current
-  // content process already has the observer set up. After Auto Tab Discard recreates
-  // a content process, the guard is undefined in the new scope and the script re-inits.
+  // Attach (or re-attach) the chrome-side message listener for a browser. Returns
+  // the record, or null if no message manager is available.
+  function ensureAttached(browser) {
+    if (!browser) return null;
+    const mm = browser.messageManager;
+    if (!mm?.addMessageListener) return null;
+    let rec = browserState.get(browser);
+    if (rec && rec.mm === mm) return rec;
+    // New browser, or the mm was recreated under us — drop any stale listener and
+    // attach to the live mm.
+    if (rec && rec.mm && rec.listener) {
+      try { rec.mm.removeMessageListener(MESSAGE_NAME, rec.listener); } catch {}
+    }
+    const listener = makeListener(browser);
+    try { mm.addMessageListener(MESSAGE_NAME, listener); }
+    catch (e) {
+      // Drop any stale record so the next attempt retries cleanly, rather than
+      // leaving a record with loaded:true that makes the cache-hit path skip the
+      // frame-script reload for this (still-unlistened) browser.
+      log('listener attach failed', e);
+      browserState.delete(browser);
+      return null;
+    }
+    rec = { mm, listener, loaded: false };
+    browserState.set(browser, rec);
+    log('listener attached');
+    return rec;
+  }
+
+  function sendConfig(browser) {
+    if (!LIVE_MODE) return;
+    const mm = browser.messageManager;
+    if (!mm?.sendAsyncMessage) return;
+    try {
+      const url = browser.currentURI?.spec || '';
+      mm.sendAsyncMessage(CONFIG_MESSAGE_NAME, {
+        liveRateMs: LIVE_RATE_MS,
+        alwaysOn: LIVE_ALWAYS_ON || hostInLiveAllowlist(url),
+        threshold: LIVE_THRESHOLD,
+        debug: DEBUG,
+      });
+    } catch (e) { log('config message send failed', e); }
+  }
+
+  // Load the frame script into the browser's content process and push config.
+  // frame.js's globalThis guard makes a repeat load cheap (it just re-samples the
+  // current document). Marks the record loaded so cache hits can skip re-loading.
   function loadFrameScript(browser) {
-    if (!browser) return;
     const mm = browser.messageManager;
     if (!mm?.loadFrameScript) return;
     try {
       mm.loadFrameScript(FRAME_SCRIPT_URL, false);
+      sendConfig(browser);
+      const rec = browserState.get(browser);
+      if (rec) rec.loaded = true;
       log('frame script load requested');
-      // Push live-mode config down to the content scope after load. Frame.js's
-      // listener (re-)configures its state machine whenever this message
-      // arrives, so re-sending on each load is safe — and necessary, since
-      // alwaysOn is per-URL (the host allowlist applies differently to
-      // different tabs).
-      if (LIVE_MODE && mm.sendAsyncMessage) {
-        try {
-          const url = browser.currentURI?.spec || '';
-          const alwaysOn = LIVE_ALWAYS_ON || hostInLiveAllowlist(url);
-          mm.sendAsyncMessage(CONFIG_MESSAGE_NAME, {
-            liveRateMs: LIVE_RATE_MS,
-            alwaysOn,
-            threshold: LIVE_THRESHOLD,
-            debug: DEBUG,
-          });
-        } catch (e) {
-          log('config message send failed', e);
-        }
-      }
-    } catch (e) {
-      log('frame script load failed', e);
-    }
+    } catch (e) { log('frame script load failed', e); }
   }
 
-  // Tear down our refs for a browser (called on TabClose).
   function detachBrowser(browser) {
     if (!browser) return;
-    const mm = browser.messageManager;
-    const listener = browserListeners.get(browser);
-    if (mm && listener) {
-      try { mm.removeMessageListener(MESSAGE_NAME, listener); } catch {}
+    const rec = browserState.get(browser);
+    if (rec && rec.mm && rec.listener) {
+      try { rec.mm.removeMessageListener(MESSAGE_NAME, rec.listener); } catch {}
     }
-    browserListeners.delete(browser);
+    browserState.delete(browser);
     log('detached');
+  }
+
+  function sendTeardown(browser) {
+    const mm = browser.messageManager;
+    if (!mm?.sendAsyncMessage) return;
+    try { mm.sendAsyncMessage(TEARDOWN_MESSAGE_NAME, {}); } catch {}
   }
 
   function sampleAndApply(browser, forceFresh = false) {
     if (!browser) return;
     const url = browser.currentURI?.spec || '';
 
-    // Skip internal pages — Zen owns these.
-    if (url.startsWith('about:') || url.startsWith('chrome:') || url === '') {
-      applyTheme(null);
+    if (isInternalUrl(url)) { applyTheme(null); return; }
+
+    const key = cacheKey(url);
+
+    if (forceFresh) {
+      // Pre-delete so a fast subsequent TabSelect doesn't read the stale value.
+      themeCache.delete(key);
+      ensureAttached(browser);
+      loadFrameScript(browser);
       return;
     }
 
-    const key = cacheKey(url);
-    if (!forceFresh) {
-      const hit = cacheGet(key);
-      if (hit) {
-        applyTheme(hit);
-        // Make sure listener is attached so future mutations from this tab reach us.
-        // Skip the frame-script IPC — observer is already running in content.
-        attachListener(browser);
-        return;
-      }
-    } else {
-      // Pre-delete so a fast subsequent TabSelect doesn't read the stale value before
-      // the fresh sample comes back over IPC.
-      themeCache.delete(key);
+    const hit = cacheGet(key);
+    if (hit !== undefined) {
+      applyTheme(hit);
+      // The cache is keyed by URL, not browser, so a hit can land on a tab whose
+      // content process never loaded frame.js (a duplicate-URL tab, or one whose
+      // mm was recreated). Ensure the listener is live, and load the frame script
+      // once if it isn't already running — otherwise that tab gets the static tint
+      // but no mutation/live-mode updates. Repeat visits keep the fast path.
+      const rec = ensureAttached(browser);
+      if (rec && !rec.loaded) loadFrameScript(browser);
+      return;
     }
 
-    // Cache miss or forced fresh: need a sample. Ensure both sides are wired up.
-    attachListener(browser);
+    // Cache miss: need a sample.
+    ensureAttached(browser);
     loadFrameScript(browser);
   }
 
-  // Coalesce rapid back-to-back schedule calls (TabSelect followed immediately by
-  // onLocationChange, two onLocationChanges from a redirect, etc.) into a single
-  // run. If any caller asked for forceFresh, the coalesced run honors it.
-  //
-  // Reliability: we race requestAnimationFrame (preferred — yields to next paint)
-  // against a setTimeout safety net. Whichever fires first wins; the other is
-  // canceled. This matters because rAF in chrome scope can be throttled or
-  // suppressed when the chrome window is occluded, minimized, or otherwise
-  // rendering-idle — without the setTimeout fallback the `scheduled` flag would
-  // stick true and all future tab-switch updates would be dropped.
-  //
-  // Belt-and-suspenders: a self-heal check resets the flag if it's been stuck for
-  // longer than the safety-net interval, so even if both timers somehow fail to
-  // fire the next scheduleSample call recovers.
+  // Coalesce rapid back-to-back schedule calls into a single run. We race
+  // requestAnimationFrame (yields to next paint) against a setTimeout safety net
+  // (rAF can be throttled when the window is occluded); whichever fires first
+  // wins and cancels the other.
   const SCHEDULE_SAFETY_MS = 100;
   let scheduled = false;
   let scheduledForce = false;
-  let scheduledAt = 0;
   let scheduleRafId = 0;
   let scheduleTimerId = 0;
+  function runScheduled() {
+    if (!scheduled) return; // already ran via the other path
+    scheduled = false;
+    try { if (scheduleRafId) cancelAnimationFrame(scheduleRafId); } catch {}
+    try { if (scheduleTimerId) clearTimeout(scheduleTimerId); } catch {}
+    scheduleRafId = 0;
+    scheduleTimerId = 0;
+    const force = scheduledForce;
+    scheduledForce = false;
+    sampleAndApply(gBrowser.selectedBrowser, force);
+  }
   function scheduleSample(forceFresh = false) {
     if (forceFresh) scheduledForce = true;
-    // Self-heal: if the flag has been stuck longer than the safety-net interval,
-    // assume both timers somehow missed and reset so we can re-schedule.
-    if (scheduled && Date.now() - scheduledAt > SCHEDULE_SAFETY_MS * 4) {
-      log('schedule flag stuck — self-healing');
-      scheduled = false;
-    }
     if (scheduled) return;
     scheduled = true;
-    scheduledAt = Date.now();
-    const run = () => {
-      if (!scheduled) return; // already ran via the other path
-      scheduled = false;
-      try { if (scheduleRafId) cancelAnimationFrame(scheduleRafId); } catch {}
-      try { if (scheduleTimerId) clearTimeout(scheduleTimerId); } catch {}
-      scheduleRafId = 0;
-      scheduleTimerId = 0;
-      const force = scheduledForce;
-      scheduledForce = false;
-      sampleAndApply(gBrowser.selectedBrowser, force);
-    };
-    scheduleRafId = requestAnimationFrame(run);
-    scheduleTimerId = setTimeout(run, SCHEDULE_SAFETY_MS);
+    scheduleRafId = requestAnimationFrame(runScheduled);
+    scheduleTimerId = setTimeout(runScheduled, SCHEDULE_SAFETY_MS);
   }
 
-  // TabSelect: user switched tabs. Cache hit fast path; else sample.
-  gBrowser.tabContainer.addEventListener('TabSelect', () => scheduleSample(false));
-
-  // TabClose: clean up our per-browser state.
-  gBrowser.tabContainer.addEventListener('TabClose', (evt) => {
-    const browser = evt.target?.linkedBrowser;
-    if (browser) detachBrowser(browser);
-  });
+  // Named handlers so cleanup() can remove them.
+  const onTabSelect = () => scheduleSample(false);
+  const onTabClose = (evt) => { const browser = evt.target?.linkedBrowser; if (browser) detachBrowser(browser); };
+  gBrowser.tabContainer.addEventListener('TabSelect', onTabSelect);
+  gBrowser.tabContainer.addEventListener('TabClose', onTabClose);
 
   // onLocationChange: top-level navigation/reload in active tab — bypass cache.
-  // Filter isTopLevel so iframe/subframe loads (OAuth popups, ad frames) don't trigger
-  // wasted re-samples.
   const progressListener = {
     QueryInterface: ChromeUtils.generateQI(['nsIWebProgressListener', 'nsISupportsWeakReference']),
     onLocationChange(progress, request, location, flags) {
@@ -388,57 +346,47 @@
       if (flags & Ci.nsIWebProgressListener.LOCATION_CHANGE_SAME_DOCUMENT) return;
       scheduleSample(true);
     },
-    onStateChange() {},
-    onProgressChange() {},
-    onStatusChange() {},
-    onSecurityChange() {},
-    onContentBlockingEvent() {},
+    onStateChange() {}, onProgressChange() {}, onStatusChange() {},
+    onSecurityChange() {}, onContentBlockingEvent() {},
   };
   gBrowser.addProgressListener(progressListener);
 
   // Initial run after the window finishes loading.
-  if (document.readyState === 'complete') {
-    scheduleSample(false);
-  } else {
-    window.addEventListener('load', () => scheduleSample(false), { once: true });
-  }
+  if (document.readyState === 'complete') scheduleSample(false);
+  else window.addEventListener('load', () => scheduleSample(false), { once: true });
 
-  // OS color scheme change (user toggles macOS appearance, etc.). Every cached entry
-  // is now stale — sites that respect prefers-color-scheme will render the other
-  // theme on next visit. Clear the cache so we re-sample fresh, then refresh the
-  // active tab immediately.
+  // OS color scheme change: every cached entry is now stale. Clear and re-sample.
   let colorSchemeQuery = null;
   let onColorSchemeChange = null;
   try {
     colorSchemeQuery = window.matchMedia('(prefers-color-scheme: dark)');
-    onColorSchemeChange = () => {
-      themeCache.clear();
-      log('color-scheme changed, cache cleared');
-      scheduleSample(true);
-    };
+    onColorSchemeChange = () => { themeCache.clear(); log('color-scheme changed, cache cleared'); scheduleSample(true); };
     colorSchemeQuery.addEventListener('change', onColorSchemeChange);
   } catch {}
 
-  // Cleanup on window unload. Sine's addUnloadListener is preferred when available
-  // (it survives mod hot-reload); fall back to a one-shot 'unload' on the window.
+  // Cleanup on window unload / mod hot-reload. Sine's addUnloadListener is
+  // preferred (it survives hot-reload); fall back to a one-shot 'unload'.
   const cleanup = () => {
     try { gBrowser.removeProgressListener(progressListener); } catch {}
+    try { gBrowser.tabContainer.removeEventListener('TabSelect', onTabSelect); } catch {}
+    try { gBrowser.tabContainer.removeEventListener('TabClose', onTabClose); } catch {}
     try {
-      if (colorSchemeQuery && onColorSchemeChange) {
-        colorSchemeQuery.removeEventListener('change', onColorSchemeChange);
-      }
+      if (colorSchemeQuery && onColorSchemeChange) colorSchemeQuery.removeEventListener('change', onColorSchemeChange);
     } catch {}
+    try { if (scheduleRafId) cancelAnimationFrame(scheduleRafId); } catch {}
+    try { if (scheduleTimerId) clearTimeout(scheduleTimerId); } catch {}
+    scheduled = false;
+    // Detach every open browser's listener and tell its content process to tear
+    // down (stop observers / polling). Iterates live browsers because the
+    // per-browser WeakMap isn't enumerable; closed tabs already detached on
+    // TabClose.
+    try { for (const browser of gBrowser.browsers) { detachBrowser(browser); sendTeardown(browser); } } catch {}
     applyTheme(null);
-    // Drop the persistent markers so no smoothing transitions linger on chrome
-    // elements after the mod is unloaded / hot-reloaded.
     root.removeAttribute('zen-page-tint-active');
     root.removeAttribute('zen-page-tint-live');
   };
-  if (typeof addUnloadListener === 'function') {
-    addUnloadListener(cleanup);
-  } else {
-    window.addEventListener('unload', cleanup, { once: true });
-  }
+  if (typeof addUnloadListener === 'function') addUnloadListener(cleanup);
+  else window.addEventListener('unload', cleanup, { once: true });
 
   log('initialized');
 })();

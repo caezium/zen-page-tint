@@ -39,7 +39,9 @@
     }
   }
 
-  &:has([zen-compact-mode="true"]) #zen-appcontent-wrapper {
+  /* Zen sets zen-compact-mode on the root element itself, so match it on `&`
+     (this :root rule), not via :has() which only looks at descendants. */
+  &[zen-compact-mode="true"] #zen-appcontent-wrapper {
     margin: var(--zpt-frame-gap) !important;
   }
 
@@ -133,7 +135,11 @@
 
   #tabbrowser-tabbox #tabbrowser-tabpanels .browserSidebarContainer {
     :root:not([zen-no-padding="true"]) &:not(.zen-glance-overlay) {
-      --zen-native-inner-radius: 0 0 var(--zen-native-inner-radius) var(--zen-native-inner-radius);
+      /* Flat top, rounded bottom. Must NOT reference --zen-native-inner-radius in
+         its own value — a custom property that references itself is a CSS cycle and
+         computes to guaranteed-invalid, collapsing the rounding. Use our own
+         frame-radius knob instead. */
+      --zen-native-inner-radius: 0 0 var(--zpt-frame-radius) var(--zpt-frame-radius);
       --zen-big-shadow: none;
     }
   }
@@ -155,7 +161,10 @@
       background: var(--zen-tab-header-background, var(--zen-main-browser-background)) !important;
     }
 
-    #main-window,
+    /* `&` is the root element (= #main-window). A nested `#main-window` selector
+       desugars to ":root[zen-page-tint=on] #main-window" — #main-window as a
+       descendant of itself — which never matches, so it was previously dead. */
+    &,
     #browser,
     #appcontent {
       background-image: none !important;
@@ -213,11 +222,14 @@
       background-color: Canvas !important;
     }
 
-    /* Tint ring filling the frame gap around the toolbox / content. Spread MUST
-       equal --zpt-frame-gap (not a hardcoded value): a wider spread laps past
-       the gap onto the page as a 1px lip of tint on the content-facing edge. */
-    :root:not([zen-compact-mode="true"]) #navigator-toolbox,
-    :root:not([zen-compact-mode="true"]) .browserSidebarContainer {
+    /* Tint ring filling the frame gap around the content. Applied ONLY to
+       .browserSidebarContainer, never #navigator-toolbox: the toolbox sits
+       outside the content wrapper's overflow:hidden, so a box-shadow on it
+       escapes and laps onto the page as a column of tint on the content-facing
+       edge (worst with a right-side sidebar). The toolbox surround is already
+       covered by #appcontent's background and the #zen-browser-background rim.
+       Spread MUST equal --zpt-frame-gap so it fills the gap without overshooting. */
+    &:not([zen-compact-mode="true"]) .browserSidebarContainer {
       overflow: visible !important;
       box-shadow: 0 0 0 var(--zpt-frame-gap) var(--zen-tab-header-background, var(--zen-main-browser-background)) !important;
     }
@@ -332,7 +344,7 @@
   :root[zen-page-tint-active="on"] {
     #zen-browser-background::before,
     #zen-browser-background::after,
-    #main-window,
+    &,
     #browser,
     #appcontent,
     #navigator-toolbox,

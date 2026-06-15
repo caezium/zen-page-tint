@@ -1,2 +1,3 @@
 sync-to-zen.sh
 .scguard/
+*.profraw
