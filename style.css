@@ -182,6 +182,19 @@
       box-shadow: none !important;
     }
 
+    /* .zen-workspace-tabs-section's box extends a few px past the sidebar's
+       content-facing edge; with a tinted background that overhang paints as a
+       stray column of tint over the page (most visible with a right-side
+       sidebar — diagnosed by bisecting the tinted surfaces). Its parent
+       #navigator-toolbox is already tinted and backs the in-bounds tab area, so
+       we drop the tint from THIS element specifically: the visible tabs stay
+       tinted via the toolbox behind them, and the overhanging strip paints
+       nothing. (It stays in the chrome-surface rule above for the appearance /
+       color / box-shadow resets — only its background is cleared here.) */
+    .zen-workspace-tabs-section {
+      background-color: transparent !important;
+    }
+
     /* .browserSidebarContainer directly backs the web content (the <browser>
        renders inside it), so it must NOT carry the page tint as its background.
        A page that paints no opaque background of its own — a transparent or
@@ -200,10 +213,13 @@
       background-color: Canvas !important;
     }
 
+    /* Tint ring filling the frame gap around the toolbox / content. Spread MUST
+       equal --zpt-frame-gap (not a hardcoded value): a wider spread laps past
+       the gap onto the page as a 1px lip of tint on the content-facing edge. */
     :root:not([zen-compact-mode="true"]) #navigator-toolbox,
     :root:not([zen-compact-mode="true"]) .browserSidebarContainer {
       overflow: visible !important;
-      box-shadow: 0 0 0 6px var(--zen-tab-header-background, var(--zen-main-browser-background)) !important;
+      box-shadow: 0 0 0 var(--zpt-frame-gap) var(--zen-tab-header-background, var(--zen-main-browser-background)) !important;
     }
 
     #zen-sidebar-splitter,
