@@ -16,6 +16,6 @@
     "content": ""
   },
   "readme": "README.md",
-  "no-updates": true,
+  "no-updates": false,
   "enabled": true
 }
