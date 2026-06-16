@@ -8,6 +8,11 @@ Adaptive chrome color for [Zen Browser](https://zen-browser.app/) — the URL ba
 
 *The URL bar, sidebar, titlebar, and outer rim tint to the active page as you switch tabs.*
 
+
+![Live mode — the chrome follows a playing video](assets/live.gif)
+
+*Live mode: with a video playing, the chrome continuously tracks the scene's color.*
+
 ## Why this exists
 
 Stock Zen uses a single accent color across the chrome. On a vibrant page that looks fine; on a strongly-themed page the contrast feels off and the chrome reads as separate from the content. Tinting the chrome to the page bg merges them visually — like Arc and Dia do.
