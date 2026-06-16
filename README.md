@@ -4,7 +4,9 @@ Adaptive chrome color for [Zen Browser](https://zen-browser.app/) — the URL ba
 
 **Built for heavy-tab sessions.** Tested at 1,200+ open tabs without measurable tab-switch lag.
 
-<!-- TODO: drop a screenshot/GIF here. Side-by-side of chrome on a light vs dark page, or a short clip of switching between 4-5 contrasty tabs, lands much better than text. -->
+![Zen Page Tint — the chrome color follows the active page](assets/demo.gif)
+
+*The URL bar, sidebar, titlebar, and outer rim tint to the active page as you switch tabs.*
 
 ## Why this exists
 
@@ -56,6 +58,10 @@ In `about:config` (pref changes take effect on the next Zen restart):
 | `zen.page-tint.live-mode-smoothing-ms` | `1000` | Duration of the CSS fade applied to **every** tint change (live ticks, event-driven samples, and tab-switch cache hits). |
 | `zen.page-tint.live-mode-always-on` | `false` | When `false`, live polling only runs while a `<video>` on the page is actually playing — static pages cost nothing. Set `true` to poll every foregrounded page regardless. |
 | `zen.page-tint.live-mode-hosts` | `''` | Comma-separated host allowlist; matching sites are treated as always-on. The supported workaround for players auto-detect can't see — canvas/WebGL players and cross-origin `<iframe>` embeds. Matched by hostname, so port-independent (`localhost` matches `localhost:3000`). Supports `*.example.com`. Example: `example.com, *.spotify.com, localhost`. |
+
+![Live mode — the chrome follows a playing video](assets/live.gif)
+
+*Live mode: with a video playing, the chrome continuously tracks the scene's color.*
 
 ## Known limitations
 
