@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Zen Page Tint
 // @description    Adaptive Zen chrome color from the active page
-// @version        1.2.0
+// @version        1.5.1
 // ==/UserScript==
 
 (() => {
@@ -51,22 +51,59 @@
   const LIVE_HOSTS_RAW = prefStr('zen.page-tint.live-mode-hosts', '');
   const LIVE_THRESHOLD = prefInt('zen.page-tint.live-mode-threshold', 8);
 
-  // Parse the allowlist once. Supports exact-host and leading-wildcard patterns
-  // ('*.example.com' matches 'foo.example.com' but not 'example.com'). Matched
-  // against URL.hostname, so entries are port-independent.
-  const LIVE_HOSTS = LIVE_HOSTS_RAW.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  // CSS-side appearance knobs. Unlike the live-mode prefs (read once at
+  // frame-script load, so they need a restart), these only drive CSS variables,
+  // so they're applied live via a pref observer below — changing them in the Sine
+  // settings panel updates the chrome immediately.
+  //
+  //   zen.page-tint.mix-amount   (int 0..100, default 100)  → --zpt-strength
+  //     Tint STRENGTH: the page color is laid as a translucent OVERLAY over Zen's
+  //     own chrome (including workspace gradients) at this opacity. 100 = fully
+  //     opaque page tint (the original look); 0 = no tint, your untouched Zen
+  //     theme/gradient shows through; in between veils the gradient with the page
+  //     color. Done as an overlay (not a solid color blend) precisely because a
+  //     workspace gradient is a gradient, not a single color, so it can't be
+  //     reproduced by mixing one color — see style.css --zpt-tint / the rim rule.
+  //   zen.page-tint.frame-gap    (int px, default 5)   → --zpt-frame-gap
+  //   zen.page-tint.frame-radius (int px, default 14)  → --zpt-frame-radius
+  //   zen.page-tint.saturation   (int 0..200, default 100)
+  //     Scales the sampled color's HSL saturation before it's applied. 0 =
+  //     grayscale chrome, 100 = the page's own saturation, 200 = double (more
+  //     vibrant). Adjusted in JS so the readable-foreground pick uses the result.
+  //   zen.page-tint.min-lightness / .max-lightness (int 0..100, default 0 / 100)
+  //     Clamp the sampled color's HSL lightness into [min, max]. Keeps blinding-
+  //     white pages from washing the chrome out and near-black pages from going
+  //     muddy. Defaults (0 / 100) are a no-op.
+  //   zen.page-tint.disable-hosts (string, default '')
+  //     Comma-separated host list (same syntax as live-mode-hosts, supports
+  //     *.example.com) where the tint is turned OFF entirely — the chrome keeps
+  //     your Zen theme on those sites.
+  const clampInt = (n, lo, hi) => Math.max(lo, Math.min(hi, n | 0));
+  let MIX_AMOUNT = clampInt(prefInt('zen.page-tint.mix-amount', 100), 0, 100);
+  let SATURATION = clampInt(prefInt('zen.page-tint.saturation', 100), 0, 200);
+  let MIN_LIGHT = clampInt(prefInt('zen.page-tint.min-lightness', 0), 0, 100);
+  let MAX_LIGHT = clampInt(prefInt('zen.page-tint.max-lightness', 100), 0, 100);
 
-  function hostInLiveAllowlist(url) {
-    if (LIVE_HOSTS.length === 0) return false;
+  // Host-pattern matching. Supports exact-host and leading-wildcard patterns
+  // ('*.example.com' matches 'foo.example.com' but not 'example.com'). Matched
+  // against URL.hostname, so entries are port-independent. Shared by the live-mode
+  // allowlist and the per-site disable list.
+  function parseHostList(raw) {
+    return raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  }
+  function hostMatches(url, patterns) {
+    if (!patterns.length) return false;
     try {
       const host = new URL(url).hostname.toLowerCase();
-      for (const pattern of LIVE_HOSTS) {
+      for (const pattern of patterns) {
         if (pattern.startsWith('*.')) { if (host.endsWith(pattern.slice(1))) return true; }
         else if (host === pattern) return true;
       }
     } catch {}
     return false;
   }
+  const LIVE_HOSTS = parseHostList(LIVE_HOSTS_RAW);
+  let DISABLE_HOSTS = parseHostList(prefStr('zen.page-tint.disable-hosts', ''));
 
   log('live-mode pref =', LIVE_MODE,
     '| rate =', LIVE_RATE_MS, 'ms',
@@ -84,6 +121,10 @@
   // Smoothing transitions are always armed, so the smoothing variable is set
   // unconditionally.
   root.style.setProperty('--zpt-live-smoothing-ms', `${LIVE_SMOOTH_MS}ms`);
+
+  // Tint strength / frame gap / radius are pref-driven (Sine settings panel);
+  // apply at startup.
+  applyCssVarPrefs();
 
   // Persistent "mod is active in this window" marker. Smoothing transitions are
   // armed against THIS attribute (not zen-page-tint) so they survive leaving a
@@ -119,18 +160,75 @@
     return lum > 0.55 ? '#000' : '#fff';
   }
 
-  // Track the last applied color so switching between same-colored tabs (the
-  // common case — most pages are white or one of a few grays) doesn't rewrite the
-  // CSS variables and trigger a full restyle of every var() consumer (including
-  // the per-tab rules × thousands of tabs) plus a re-armed 1s fade.
-  let lastAppliedBg = undefined;
-  function applyTheme(bg) {
-    const next = bg || null;
-    if (next === lastAppliedBg) return;
-    lastAppliedBg = next;
-    if (next) {
-      const fg = readableFg(next) || 'inherit';
-      root.style.setProperty('--zen-tab-header-background', next);
+  // ---- HSL conversion (for the saturation / lightness-clamp adjustments) ----
+  // All channels 0..1.
+  function rgbToHsl(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    let h = 0, s = 0; const l = (max + min) / 2;
+    if (max !== min) {
+      const d = max - min;
+      s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+      if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+      else if (max === g) h = (b - r) / d + 2;
+      else h = (r - g) / d + 4;
+      h /= 6;
+    }
+    return { h, s, l };
+  }
+  function hslToRgb(h, s, l) {
+    if (s === 0) { const v = Math.round(l * 255); return { r: v, g: v, b: v }; }
+    const hue = (p, q, t) => {
+      if (t < 0) t += 1; if (t > 1) t -= 1;
+      if (t < 1 / 6) return p + (q - p) * 6 * t;
+      if (t < 1 / 2) return q;
+      if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+      return p;
+    };
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+    const p = 2 * l - q;
+    return {
+      r: Math.round(hue(p, q, h + 1 / 3) * 255),
+      g: Math.round(hue(p, q, h) * 255),
+      b: Math.round(hue(p, q, h - 1 / 3) * 255),
+    };
+  }
+
+  // Apply the saturation scale and lightness clamp to a sampled color. Fast-paths
+  // out when nothing is configured (the common case) so default users pay nothing.
+  function transformColor(bg) {
+    if (SATURATION === 100 && MIN_LIGHT === 0 && MAX_LIGHT === 100) return bg;
+    const rgb = parseRgb(bg);
+    if (!rgb) return bg;
+    const hsl = rgbToHsl(rgb.r, rgb.g, rgb.b);
+    hsl.s = Math.max(0, Math.min(1, hsl.s * (SATURATION / 100)));
+    const lo = Math.min(MIN_LIGHT, MAX_LIGHT) / 100;
+    const hi = Math.max(MIN_LIGHT, MAX_LIGHT) / 100;
+    hsl.l = Math.max(lo, Math.min(hi, hsl.l));
+    const out = hslToRgb(hsl.h, hsl.s, hsl.l);
+    return `rgb(${out.r}, ${out.g}, ${out.b})`;
+  }
+
+  // Push the CSS-var appearance prefs into their variables, overriding the
+  // stylesheet defaults. Idempotent — safe to call on every pref change.
+  //   --zpt-strength is the tint OVERLAY opacity (consumed by style.css's
+  //   --zpt-tint / the rim box-shadow): 100% = opaque page tint, 0% = none.
+  function applyCssVarPrefs() {
+    root.style.setProperty('--zpt-strength', `${MIX_AMOUNT}%`);
+    root.style.setProperty('--zpt-frame-gap', `${Math.max(0, prefInt('zen.page-tint.frame-gap', 5))}px`);
+    root.style.setProperty('--zpt-frame-radius', `${Math.max(0, prefInt('zen.page-tint.frame-radius', 14))}px`);
+  }
+
+  // Write the tint variables for a raw sampled color (null, or strength 0, clears
+  // the tint so Zen renders natively). Saturation / lightness adjustments are
+  // applied here; the overlay OPACITY is handled in CSS by --zpt-strength; and the
+  // readable foreground is picked against the ADJUSTED color so contrast stays
+  // correct.
+  function renderTint(rawBg) {
+    if (rawBg && MIX_AMOUNT > 0) {
+      const tint = transformColor(rawBg);
+      const fg = readableFg(tint) || 'inherit';
+      root.style.setProperty('--zen-tab-header-background', tint);
       root.style.setProperty('--zen-tab-header-foreground', fg);
       root.setAttribute('zen-page-tint', 'on');
     } else {
@@ -139,6 +237,24 @@
       root.removeAttribute('zen-page-tint');
     }
   }
+
+  // Track the last applied (raw) color so switching between
+  // same-colored tabs (the common case — most pages are white or one of a few
+  // grays) doesn't rewrite the CSS variables and trigger a full restyle of every
+  // var() consumer (including the per-tab rules × thousands of tabs) plus a
+  // re-armed 1s fade.
+  let lastAppliedBg = undefined;
+  function applyTheme(bg) {
+    const next = bg || null;
+    if (next === lastAppliedBg) return;
+    lastAppliedBg = next;
+    renderTint(next);
+  }
+
+  // Re-render from the last raw color without the same-color dedupe. Used when an
+  // appearance pref (strength / saturation / lightness) changes live: the raw page
+  // color is unchanged but its rendered result isn't.
+  function reapplyTint() { renderTint(lastAppliedBg ?? null); }
 
   function cacheKey(uri) {
     try { const u = new URL(uri); return u.origin + u.pathname; }
@@ -172,7 +288,7 @@
       // browser's current URI — an in-flight sample from the previous document can
       // arrive after navigation, and must not be cached/applied under the new URL.
       const sampled = theme.href || current;
-      if (isInternalUrl(sampled)) return;
+      if (isInternalUrl(sampled) || hostMatches(sampled, DISABLE_HOSTS)) return;
       const key = cacheKey(sampled);
       const isCurrent = cacheKey(current) === key;
       log('message received', { source: theme.source, bg: theme.bg, url: sampled });
@@ -232,7 +348,7 @@
       const url = browser.currentURI?.spec || '';
       mm.sendAsyncMessage(CONFIG_MESSAGE_NAME, {
         liveRateMs: LIVE_RATE_MS,
-        alwaysOn: LIVE_ALWAYS_ON || hostInLiveAllowlist(url),
+        alwaysOn: LIVE_ALWAYS_ON || hostMatches(url, LIVE_HOSTS),
         threshold: LIVE_THRESHOLD,
         debug: DEBUG,
       });
@@ -274,7 +390,8 @@
     if (!browser) return;
     const url = browser.currentURI?.spec || '';
 
-    if (isInternalUrl(url)) { applyTheme(null); return; }
+    // Internal pages and per-site-disabled hosts keep Zen's own chrome (no tint).
+    if (isInternalUrl(url) || hostMatches(url, DISABLE_HOSTS)) { applyTheme(null); return; }
 
     const key = cacheKey(url);
 
@@ -364,6 +481,45 @@
     colorSchemeQuery.addEventListener('change', onColorSchemeChange);
   } catch {}
 
+  // Live-apply the appearance prefs (mix / saturation / lightness / gap / radius /
+  // disable-hosts) when they're changed from the Sine settings panel, so the
+  // effect is visible without a restart. (The live-mode prefs are read once at
+  // frame-script load and still need a restart — Sine shows a restart toast for
+  // those.) A branch observer catches every zen.page-tint.* change; we act only on
+  // the live-applicable ones.
+  const prefObserver = {
+    observe(_subject, topic, data) {
+      if (topic !== 'nsPref:changed') return;
+      switch (data) {
+        case 'zen.page-tint.mix-amount':
+          MIX_AMOUNT = clampInt(prefInt('zen.page-tint.mix-amount', 100), 0, 100);
+          applyCssVarPrefs();   // push the new --zpt-strength
+          reapplyTint();        // re-evaluate the tint (strength may have crossed 0)
+          break;
+        case 'zen.page-tint.saturation':
+          SATURATION = clampInt(prefInt('zen.page-tint.saturation', 100), 0, 200);
+          reapplyTint();
+          break;
+        case 'zen.page-tint.min-lightness':
+        case 'zen.page-tint.max-lightness':
+          MIN_LIGHT = clampInt(prefInt('zen.page-tint.min-lightness', 0), 0, 100);
+          MAX_LIGHT = clampInt(prefInt('zen.page-tint.max-lightness', 100), 0, 100);
+          reapplyTint();
+          break;
+        case 'zen.page-tint.disable-hosts':
+          DISABLE_HOSTS = parseHostList(prefStr('zen.page-tint.disable-hosts', ''));
+          scheduleSample(false); // re-evaluate the active tab (clear or restore)
+          break;
+        case 'zen.page-tint.frame-gap':
+        case 'zen.page-tint.frame-radius':
+          applyCssVarPrefs();
+          break;
+      }
+    },
+  };
+  try { Services.prefs.addObserver('zen.page-tint.', prefObserver); }
+  catch (e) { log('pref observer add failed', e); }
+
   // Cleanup on window unload / mod hot-reload. Sine's addUnloadListener is
   // preferred (it survives hot-reload); fall back to a one-shot 'unload'.
   const cleanup = () => {
@@ -373,6 +529,7 @@
     try {
       if (colorSchemeQuery && onColorSchemeChange) colorSchemeQuery.removeEventListener('change', onColorSchemeChange);
     } catch {}
+    try { Services.prefs.removeObserver('zen.page-tint.', prefObserver); } catch {}
     try { if (scheduleRafId) cancelAnimationFrame(scheduleRafId); } catch {}
     try { if (scheduleTimerId) clearTimeout(scheduleTimerId); } catch {}
     scheduled = false;

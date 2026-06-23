@@ -44,25 +44,33 @@ Enable in Sine, restart Zen.
 
 ## Configuration
 
-In `style.css` `:root`:
+Everything is configurable from the **Sine settings panel** for this mod (Zen → Sine → Zen Page Tint → ⚙). Each setting maps 1:1 to an `about:config` pref, so you can also set them there directly.
 
-```css
---zpt-frame-gap: 5px;       /* gap between content area and window edge */
---zpt-frame-radius: 14px;   /* content corner radius */
---zpt-frame-shadow: ...;    /* drop shadow on content frame */
-```
-
-In `about:config` (pref changes take effect on the next Zen restart):
+**Apply live** (no restart):
 
 | Pref | Default | Effect |
 |---|---|---|
-| `zen.page-tint.debug` | `false` | When `true`, logs diagnostic events to the Browser Console (`Cmd-Shift-J` / `Ctrl-Shift-J`). Toggle live. |
+| `zen.page-tint.mix-amount` | `100` | Tint **strength** (0–100): the sampled **page** color is laid as a translucent **overlay** over Zen's own chrome (including per-workspace gradients). `100` = full page color (the default); `0` = no tint, your untouched Zen theme/gradient shows through; in between veils the gradient with the page color. (It's an opacity overlay, not a color blend, because a workspace gradient can't be reproduced by mixing a single color.) |
+| `zen.page-tint.saturation` | `100` | Vibrancy (0–200) of the tint. `0` = grayscale chrome, `100` = the page's own saturation, `200` = double. |
+| `zen.page-tint.min-lightness` | `0` | Lightness **floor** (0–100): keeps near-black pages from making the chrome muddy. `0` = no floor. |
+| `zen.page-tint.max-lightness` | `100` | Lightness **cap** (0–100): keeps blinding-white pages from washing the chrome out. `100` = no cap. |
+| `zen.page-tint.disable-hosts` | `''` | Comma-separated host list (same syntax as `live-mode-hosts`, supports `*.example.com`) where the tint is turned **off** — the chrome keeps your Zen theme on those sites. |
+| `zen.page-tint.frame-gap` | `5` | Gap (px) between the content area and the window edge. |
+| `zen.page-tint.frame-radius` | `14` | Content corner radius (px). |
+
+**Need a restart** (read once at load):
+
+| Pref | Default | Effect |
+|---|---|---|
 | `zen.page-tint.live-mode` | `true` | Master switch for live mode — continuous polling so the chrome tint follows video / animated content. When off, the tint is purely event-driven. |
 | `zen.page-tint.live-mode-rate-ms` | `2000` | The **idle** poll interval (0.5 Hz). Sampling is adaptive: it speeds up to `rate ÷ 4` (floored at 250 ms / 4 Hz) while the color is actively changing, then backs off to this rate once it's stable. So scene changes are followed responsively while static frames stay cheap. |
 | `zen.page-tint.live-mode-threshold` | `8` | Minimum per-channel color change (0–255) needed to actually re-tint the chrome during live polling. Imperceptible frame-to-frame jitter below this is ignored, so the chrome doesn't churn (and the adaptive rate backs off) on near-static scenes. `0` = re-tint on any change. |
 | `zen.page-tint.live-mode-smoothing-ms` | `1000` | Duration of the CSS fade applied to **every** tint change (live ticks, event-driven samples, and tab-switch cache hits). |
 | `zen.page-tint.live-mode-always-on` | `false` | When `false`, live polling only runs while a `<video>` on the page is actually playing — static pages cost nothing. Set `true` to poll every foregrounded page regardless. |
 | `zen.page-tint.live-mode-hosts` | `''` | Comma-separated host allowlist; matching sites are treated as always-on. The supported workaround for players auto-detect can't see — canvas/WebGL players and cross-origin `<iframe>` embeds. Matched by hostname, so port-independent (`localhost` matches `localhost:3000`). Supports `*.example.com`. Example: `example.com, *.spotify.com, localhost`. |
+| `zen.page-tint.debug` | `false` | When `true`, logs diagnostic events to the Browser Console (`Cmd-Shift-J` / `Ctrl-Shift-J`). |
+
+The `--zpt-frame-shadow` drop shadow is still a CSS knob in `style.css` `:root` if you want to tune it.
 
 ## Known limitations
 

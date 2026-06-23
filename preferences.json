@@ -1,0 +1,143 @@
+[
+  {
+    "type": "text",
+    "label": "Zen Page Tint",
+    "size": "20px",
+    "margin": "18px 0 2px 0"
+  },
+  {
+    "type": "text",
+    "label": "Adaptive chrome color from the active page. Settings marked “restart” take effect after Zen is restarted; the rest apply instantly.",
+    "size": "12px",
+    "margin": "0 0 6px 0"
+  },
+
+  {
+    "type": "separator",
+    "label": "Appearance — applies live",
+    "margin": "14px 0 8px 0"
+  },
+  {
+    "type": "string",
+    "value": "number",
+    "property": "zen.page-tint.mix-amount",
+    "label": "Tint strength (0–100): page color laid as an overlay over your Zen theme. 100 = full page color, 0 = your untouched Zen theme/gradient.",
+    "defaultValue": 100,
+    "placeholder": "100"
+  },
+  {
+    "type": "string",
+    "value": "number",
+    "property": "zen.page-tint.saturation",
+    "label": "Saturation (0–200): vibrancy of the tint. 0 = grayscale, 100 = the page's own, 200 = double.",
+    "defaultValue": 100,
+    "placeholder": "100"
+  },
+  {
+    "type": "string",
+    "value": "number",
+    "property": "zen.page-tint.min-lightness",
+    "label": "Minimum lightness (0–100): floor so near-black pages don't make the chrome muddy. 0 = no floor.",
+    "defaultValue": 0,
+    "placeholder": "0"
+  },
+  {
+    "type": "string",
+    "value": "number",
+    "property": "zen.page-tint.max-lightness",
+    "label": "Maximum lightness (0–100): cap so blinding-white pages don't wash the chrome out. 100 = no cap.",
+    "defaultValue": 100,
+    "placeholder": "100"
+  },
+  {
+    "type": "string",
+    "property": "zen.page-tint.disable-hosts",
+    "label": "Disable on these sites (comma-separated hosts; supports *.example.com). The chrome keeps your Zen theme on them.",
+    "defaultValue": "",
+    "placeholder": "example.com, *.github.com"
+  },
+  {
+    "type": "string",
+    "value": "number",
+    "property": "zen.page-tint.frame-gap",
+    "label": "Frame gap (px): space between the content area and the window edge.",
+    "defaultValue": 5,
+    "placeholder": "5"
+  },
+  {
+    "type": "string",
+    "value": "number",
+    "property": "zen.page-tint.frame-radius",
+    "label": "Frame corner radius (px).",
+    "defaultValue": 14,
+    "placeholder": "14"
+  },
+
+  {
+    "type": "separator",
+    "label": "Live mode — follow video / animated pages (restart)",
+    "margin": "16px 0 8px 0"
+  },
+  {
+    "type": "checkbox",
+    "property": "zen.page-tint.live-mode",
+    "label": "Enable live mode (continuously follow video / animated content).",
+    "defaultValue": true,
+    "restart": true
+  },
+  {
+    "type": "checkbox",
+    "property": "zen.page-tint.live-mode-always-on",
+    "label": "Always poll, not only while a video is playing (higher idle cost).",
+    "defaultValue": false,
+    "restart": true
+  },
+  {
+    "type": "string",
+    "value": "number",
+    "property": "zen.page-tint.live-mode-rate-ms",
+    "label": "Idle poll interval (ms). Lower = more responsive, more CPU.",
+    "defaultValue": 2000,
+    "placeholder": "2000",
+    "restart": true
+  },
+  {
+    "type": "string",
+    "value": "number",
+    "property": "zen.page-tint.live-mode-threshold",
+    "label": "Re-tint threshold (0–255): minimum per-channel color change needed to re-tint while polling.",
+    "defaultValue": 8,
+    "placeholder": "8",
+    "restart": true
+  },
+  {
+    "type": "string",
+    "value": "number",
+    "property": "zen.page-tint.live-mode-smoothing-ms",
+    "label": "Color fade duration (ms) applied to every tint change.",
+    "defaultValue": 1000,
+    "placeholder": "1000",
+    "restart": true
+  },
+  {
+    "type": "string",
+    "property": "zen.page-tint.live-mode-hosts",
+    "label": "Always-on host allowlist (comma-separated) for canvas/WebGL players and cross-origin video embeds. Supports *.example.com.",
+    "defaultValue": "",
+    "placeholder": "example.com, *.spotify.com, localhost",
+    "restart": true
+  },
+
+  {
+    "type": "separator",
+    "label": "Advanced (restart)",
+    "margin": "16px 0 8px 0"
+  },
+  {
+    "type": "checkbox",
+    "property": "zen.page-tint.debug",
+    "label": "Debug logging to the Browser Console (Cmd/Ctrl-Shift-J).",
+    "defaultValue": false,
+    "restart": true
+  }
+]

@@ -40,9 +40,19 @@
   }
 
   /* Zen sets zen-compact-mode on the root element itself, so match it on `&`
-     (this :root rule), not via :has() which only looks at descendants. */
+     (this :root rule), not via :has() which only looks at descendants.
+
+     Compact mode keeps the content frame FLUSH to the window edges (margin: 0).
+     An inset here pushes Zen's collapsed top-toolbar / sidebar hover-trigger
+     strips inward, so the screen-edge reveal — slamming the cursor to the very
+     top of the screen, a Fitts's-law infinite-target edge — stops working and
+     you can only trigger by hovering *inside* the gap. Flush restores Zen's
+     native trigger zones. The frame shadow is dropped too: with no gap there's
+     nowhere for it to sit, and it would otherwise lap over the floating
+     compact sidebar / window edge. (#11) */
   &[zen-compact-mode="true"] #zen-appcontent-wrapper {
-    margin: var(--zpt-frame-gap) !important;
+    margin: 0 !important;
+    box-shadow: none !important;
   }
 
   &[chromehidden~="toolbar"],
@@ -60,7 +70,7 @@
 
   /* URL bar background tints to page color */
   #zen-appcontent-navbar-wrapper {
-    background-color: var(--zen-tab-header-background, var(--zen-main-browser-background-toolbar));
+    background-color: var(--zpt-tint, var(--zen-tab-header-background, var(--zen-main-browser-background-toolbar)));
     box-shadow: none;
     color: var(--zen-tab-header-foreground, inherit);
     fill: currentColor;
@@ -74,10 +84,18 @@
 
   /* URL input text — explicitly follow the foreground so the URL is readable
      when the page bg is very light (black text on white) or very dark (white on dark).
-     Without this, Zen's defaults stay gray and the URL goes nearly invisible. */
-  #urlbar:not([zen-floating-urlbar="true"]),
-  #urlbar:not([zen-floating-urlbar="true"]) .urlbar-input-box,
-  #urlbar:not([zen-floating-urlbar="true"]) #urlbar-input {
+     Without this, Zen's defaults stay gray and the URL goes nearly invisible.
+
+     Scoped to :not([breakout-extend]): when the urlbar is focused it "breaks out"
+     into Zen's own floating results panel, which paints its OWN themed (scheme-
+     based, often dark) background — not the page tint. Forcing our page-derived
+     foreground there made the input/results text e.g. black-on-dark and invisible
+     on a light page in dark color-scheme. Mirroring Zen's own
+     `#urlbar:not([breakout-extend])` convention hands the broken-out panel back
+     to Zen's theming (which is contrast-correct for its own surface). (#11) */
+  #urlbar:not([zen-floating-urlbar="true"]):not([breakout-extend]),
+  #urlbar:not([zen-floating-urlbar="true"]):not([breakout-extend]) .urlbar-input-box,
+  #urlbar:not([zen-floating-urlbar="true"]):not([breakout-extend]) #urlbar-input {
     color: var(--zen-tab-header-foreground, inherit) !important;
     --toolbar-field-color: var(--zen-tab-header-foreground, currentColor);
     --input-color: var(--zen-tab-header-foreground, currentColor);
@@ -93,8 +111,8 @@
   #zen-appcontent-navbar-wrapper :is(
     #nav-bar-customization-target > :not(#urlbar-container):not(#urlbar[zen-floating-urlbar="true"]),
     #nav-bar-customization-target > :not(#urlbar-container):not(#urlbar[zen-floating-urlbar="true"]) :is(toolbarbutton, .toolbarbutton-1, .toolbarbutton-icon, .toolbarbutton-text, .urlbar-icon),
-    #urlbar:not([zen-floating-urlbar="true"]) #urlbar-input-container :is(.urlbar-page-action, .identity-box-button, .urlbar-icon),
-    #urlbar:not([zen-floating-urlbar="true"]) #urlbar-input-container :is(.urlbar-page-action, .identity-box-button) :is(.toolbarbutton-icon, .urlbar-icon),
+    #urlbar:not([zen-floating-urlbar="true"]):not([breakout-extend]) #urlbar-input-container :is(.urlbar-page-action, .identity-box-button, .urlbar-icon),
+    #urlbar:not([zen-floating-urlbar="true"]):not([breakout-extend]) #urlbar-input-container :is(.urlbar-page-action, .identity-box-button) :is(.toolbarbutton-icon, .urlbar-icon),
     #personal-bookmarks,
     #PersonalToolbar :is(#personal-bookmarks, .browser-toolbar),
     #PersonalToolbar :is(toolbarbutton, .toolbarbutton-1, .toolbarbutton-icon, .toolbarbutton-text, .bookmark-item),
@@ -153,12 +171,27 @@
 
 @layer zen-page-tint {
   :root[zen-page-tint="on"] {
-    /* Override Zen's window-background element so the outer rim (window edges /
-       chrome-bleed area) tints to match the page instead of showing Zen's
-       theme accent color (e.g., purple). */
+    /* The page tint as a translucent OVERLAY color: the sampled page color at
+       --zpt-strength opacity (driven by the mix-amount pref). Surfaces paint THIS
+       instead of the opaque page color, so below 100% strength Zen's own chrome —
+       including the per-workspace gradient — shows through. At 100% it's fully
+       opaque = the original behavior; at 0% JS drops zen-page-tint entirely so
+       none of this applies. This is why mix is an opacity overlay, not a color
+       blend: a workspace gradient is a gradient, not a single color, so it can't
+       be reproduced by mixing one color. */
+    --zpt-tint: color-mix(in srgb,
+      var(--zen-tab-header-background, var(--zen-main-browser-background)) var(--zpt-strength, 100%),
+      transparent);
+
+    /* Outer rim / window-background element. Zen paints the workspace gradient on
+       these pseudos' `background`; we must NOT overwrite it (that's what made
+       strength < 100% impossible — the gradient was gone). Instead lay our
+       translucent tint OVER it with an inset box-shadow that fills the pseudo:
+       100% strength fully covers the gradient (old look), lower strengths reveal
+       it, and the rim still matches the surfaces because both use --zpt-tint. */
     #zen-browser-background::before,
     #zen-browser-background::after {
-      background: var(--zen-tab-header-background, var(--zen-main-browser-background)) !important;
+      box-shadow: inset 0 0 0 100vmax var(--zpt-tint) !important;
     }
 
     /* `&` is the root element (= #main-window). A nested `#main-window` selector
@@ -168,7 +201,7 @@
     #browser,
     #appcontent {
       background-image: none !important;
-      background-color: var(--zen-tab-header-background, var(--zen-main-browser-background)) !important;
+      background-color: var(--zpt-tint, var(--zen-tab-header-background, var(--zen-main-browser-background))) !important;
     }
 
     #navigator-toolbox,
@@ -183,12 +216,34 @@
       appearance: none !important;
       -moz-appearance: none !important;
       background-image: none !important;
-      background-color: var(--zen-tab-header-background, var(--zen-main-browser-background)) !important;
+      background-color: var(--zpt-tint, var(--zen-tab-header-background, var(--zen-main-browser-background))) !important;
       color: var(--zen-tab-header-foreground, inherit) !important;
+      /* Toolbar variables too, so the URL bar text + nav buttons follow the tint
+         foreground. In single-toolbar mode the urlbar / buttons live INSIDE the
+         sidebar (#navigator-toolbox), not in #zen-appcontent-navbar-wrapper, so
+         without these they keep Zen's default (light) color and go invisible on a
+         light page. Harmless in multi-toolbar mode (the navbar handles its own). */
+      --toolbox-textcolor: var(--zen-tab-header-foreground, currentColor);
+      --toolbarbutton-icon-fill: var(--zen-tab-header-foreground, currentColor);
+      --toolbar-color: var(--zen-tab-header-foreground, currentColor);
+      --toolbar-field-color: var(--zen-tab-header-foreground, currentColor);
+      --input-color: var(--zen-tab-header-foreground, currentColor);
       border-radius: 0 !important;
       border: none !important;
       clip-path: none !important;
       box-shadow: none !important;
+    }
+
+    /* Single-toolbar mode: the sidebar's forced foreground (above) is inherited by
+       the urlbar, but when it breaks out into its own dark floating results panel
+       that page-derived color can be invisible. Pin the broken-out panel's text to
+       a scheme-aware color that matches the panel's own (scheme-based) background,
+       independent of the page tint. (Multi-toolbar handles this via the
+       :not([breakout-extend]) urlbar rule above.) */
+    &[zen-single-toolbar="true"] #urlbar[breakout-extend] {
+      --toolbar-field-color: light-dark(black, white) !important;
+      --input-color: light-dark(black, white) !important;
+      color: light-dark(black, white) !important;
     }
 
     /* .zen-workspace-tabs-section's box extends a few px past the sidebar's
@@ -202,6 +257,22 @@
        color / box-shadow resets — only its background is cleared here.) */
     .zen-workspace-tabs-section {
       background-color: transparent !important;
+    }
+
+    /* Media-controls card: Zen paints it on its own scheme-aware notification
+       surface (--zen-sidebar-notification-bg ≈ near-white in light scheme,
+       near-black in dark scheme) and its title / artist / buttons INHERIT the
+       chrome foreground. Our page-derived foreground then lands on that card
+       regardless of the card's actual color — e.g. black text on a DARK card when
+       the page is light but the browser is in dark color-scheme → invisible (#11).
+       Pin the card's text and icons to a scheme-aware color that always contrasts
+       the card's own surface, independent of the page tint. */
+    #zen-media-controls-toolbar,
+    #zen-media-controls-toolbar * {
+      color: light-dark(black, white) !important;
+    }
+    #zen-media-controls-toolbar :is(toolbarbutton, .toolbarbutton-icon, image) {
+      fill: light-dark(black, white) !important;
     }
 
     /* .browserSidebarContainer directly backs the web content (the <browser>
@@ -228,17 +299,25 @@
        escapes and laps onto the page as a column of tint on the content-facing
        edge (worst with a right-side sidebar). The toolbox surround is already
        covered by #appcontent's background and the #zen-browser-background rim.
-       Spread MUST equal --zpt-frame-gap so it fills the gap without overshooting. */
+       Spread MUST equal --zpt-frame-gap so it fills the gap without overshooting.
+
+       NOTE: deliberately NO `overflow: visible` here. It was once added thinking
+       the box-shadow needed it to escape, but an OUTSET box-shadow is never
+       clipped by the element's own overflow — so it did nothing for the ring and
+       instead let the web content (<browser>) hit-test UP into the top toolbar's
+       hover zone. On a tinted, non-compact page that made hovering the topbar
+       oscillate between the toolbar and the page — the "twitch" (#11). Leaving the
+       container's overflow at Zen's default keeps the content clipped where it
+       belongs and the ring still paints. */
     &:not([zen-compact-mode="true"]) .browserSidebarContainer {
-      overflow: visible !important;
-      box-shadow: 0 0 0 var(--zpt-frame-gap) var(--zen-tab-header-background, var(--zen-main-browser-background)) !important;
+      box-shadow: 0 0 0 var(--zpt-frame-gap) var(--zpt-tint, var(--zen-tab-header-background, var(--zen-main-browser-background))) !important;
     }
 
     #zen-sidebar-splitter,
     #sidebar-splitter {
       appearance: none !important;
       -moz-appearance: none !important;
-      background-color: var(--zen-tab-header-background, var(--zen-main-browser-background)) !important;
+      background-color: var(--zpt-tint, var(--zen-tab-header-background, var(--zen-main-browser-background))) !important;
       background-image: none !important;
       border: none !important;
       min-width: 5px !important;
@@ -335,7 +414,12 @@
  * smooth fade is kept and the scroll-time hitch is accepted as a tradeoff — tune
  * live-mode rate/threshold down if it bothers you.
  */
-:root[zen-page-tint-active="on"] #zen-appcontent-navbar-wrapper {
+/* Guarded to NON-compact mode: in compact mode Zen reveals this top toolbar by
+   animating its `height` (collapsed strip → full bar on hover). Our `transition`
+   shorthand with !important would replace that whole property and the topbar
+   would snap open/closed with no slide. Outside compact mode the toolbar is
+   always shown, so smoothing its bg/text color is safe and wanted. (#11) */
+:root[zen-page-tint-active="on"]:not([zen-compact-mode="true"]) #zen-appcontent-navbar-wrapper {
   transition: background-color var(--zpt-live-smoothing-ms, 1000ms) ease-out,
               color var(--zpt-live-smoothing-ms, 1000ms) ease-out !important;
 }
@@ -347,13 +431,11 @@
     &,
     #browser,
     #appcontent,
-    #navigator-toolbox,
     .browserSidebarContainer,
     #zen-sidebar-top-buttons,
     #zen-sidebar-foot-buttons,
     #sidebar-box,
     #sidebar-main,
-    #titlebar,
     #notifications-toolbar,
     #zen-media-controls-toolbar,
     .zen-workspace-tabs-section,
@@ -361,6 +443,18 @@
     #sidebar-splitter {
       /* background-color only — color and box-shadow are deliberately excluded
          (see comment above for the per-tab-paint and continuous-repaint cost). */
+      transition: background-color var(--zpt-live-smoothing-ms, 1000ms) ease-out !important;
+    }
+
+    /* #navigator-toolbox (the sidebar) and #titlebar carry Zen's compact-mode
+       reveal animations: the toolbox slides in/out via `left`/`right` and the
+       titlebar toggles `visibility`. Our bg-color `transition` shorthand with
+       !important replaces the whole transition property, so applying it here
+       would kill those slides — the sidebar/topbar would appear and disappear
+       with no animation. So smooth their color only OUTSIDE compact mode and let
+       Zen own the transition in compact mode (an instant bg-color swap on the
+       thin floating bar is imperceptible). (#11) */
+    &:not([zen-compact-mode="true"]) :is(#navigator-toolbox, #titlebar) {
       transition: background-color var(--zpt-live-smoothing-ms, 1000ms) ease-out !important;
     }
 
