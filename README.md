@@ -4,6 +4,8 @@ Adaptive chrome color for [Zen Browser](https://zen-browser.app/) — the URL ba
 
 **Built for heavy-tab sessions.** Tested at 1,200+ open tabs without measurable tab-switch lag.
 
+**Fully tunable** from a Sine settings panel — tint strength (overlay over your own Zen theme/gradient), saturation, lightness clamp, and per-site rules. See [Configuration](#configuration).
+
 ![Zen Page Tint — the chrome color follows the active page](assets/demo.gif)
 
 *The URL bar, sidebar, titlebar, and outer rim tint to the active page as you switch tabs.*
@@ -25,7 +27,7 @@ Other adaptive-color mods exist, but they tend to feel laggy at high tab counts 
 
 `zen-page-tint` is built around the opposite constraints:
 - **One sample per tab switch** — `TabSelect` + `onLocationChange` pairs coalesce into a single deferred run
-- **Per-origin LRU cache** (500 entries) — revisits are instant, zero IPC
+- **Per-origin LRU cache** (3000 entries) — revisits are instant, zero IPC
 - **Deferred via `requestAnimationFrame` + setTimeout race** — tab clicks register before the JS runs, and the safety-net `setTimeout` means we don't get stuck when `rAF` is throttled
 - **No transitions on per-tab elements** — color snaps; sidebar/toolbar still animate smoothly
 - **Skips `about:` / `chrome:`** — keeps Zen's defaults where they belong
@@ -82,8 +84,8 @@ The `--zpt-frame-shadow` drop shadow is still a CSS knob in `style.css` `:root` 
 2. On fire, coalesces via `requestAnimationFrame` raced against a 100ms `setTimeout` safety net (rAF can be throttled when the window is occluded), then samples the active browser.
 3. Cache hit → applies `--zen-tab-header-background` + `--zen-tab-header-foreground` instantly (no IPC).
 4. Cache miss → loads `frame.js` into the content process. Frame script samples + observes mutations, and pushes updates via `sendAsyncMessage`.
-5. Cache is bounded LRU (500 entries) keyed by `origin + pathname`. Cleared on OS color-scheme change so prefers-color-scheme-aware sites re-sample fresh.
-6. Foreground color picked via Rec 601 luminance — black or white for max contrast.
+5. Cache is bounded LRU (3000 entries) keyed by `origin + pathname`. Cleared on OS color-scheme change so prefers-color-scheme-aware sites re-sample fresh.
+6. Sampled color is adjusted (saturation / lightness clamp) and the foreground (black or white) is picked against the result via Rec 601 luminance for max contrast.
 
 **`frame.js`** runs in the content process. Sample chain (first match wins):
 1. **`drawWindow` pixel of the central 60% of the viewport, downsampled to a 16×16 grid and averaged** — ground truth of what's actually painted, weighted to the dominant central tone rather than whatever single element lands dead-center. Picks up Zen Boost overlays, dark-mode toggles, Gmail-class apps where `<body>` lies about the visible color.
@@ -97,7 +99,7 @@ Observers in content:
 - **`<head>` mutations** — `childList` + `subtree characterData` + filtered attributes on `link`/`meta`/`style`. Catches stylesheet swaps and dynamic theme-color changes.
 - **`load` + `pageshow`** — re-sample at +300ms and +2000ms with 500ms dedupe (catches slow apps that bootstrap their theme after `load` — Gmail).
 
-**`style.css`** applies the two CSS variables to URL bar, sidebar, titlebar, splitter, tab labels, and the outer window-background pseudo-elements (so the rim tints too — no accent-color bleed from Zen's theme).
+**`style.css`** lays the page color as a translucent **overlay** (`--zpt-tint`, opacity set by the strength pref) across the URL bar, sidebar, titlebar, splitter, tab labels, and the outer window-background rim. Below full strength, Zen's own theme / workspace gradient shows through; the rim uses an inset box-shadow so the gradient survives underneath instead of being painted over.
 
 ## Performance
 
@@ -111,8 +113,8 @@ Measured under a 1,200+ tab session:
 
 ## Compatibility
 
-- Tested on Zen 1.20b+ on macOS. Should work on Linux and Windows — selectors target Zen's stable chrome IDs — but I haven't verified there yet. Reports welcome.
-- Sine required (currently the only install path).
+- Developed on Zen 1.20b+ on macOS; also reported working on Linux (the compact-mode and contrast fixes in 1.5.x came from a CachyOS user). Windows should work too — selectors target Zen's stable chrome IDs — but it's unverified there. Reports welcome.
+- Sine required (install via the Sine store, or locally from this repo).
 
 ## License
 
