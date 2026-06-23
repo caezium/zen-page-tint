@@ -32,15 +32,11 @@ Other adaptive-color mods exist, but they tend to feel laggy at high tab counts 
 
 ## Install
 
-In Zen → Sine settings → **"Add your own locally from a GitHub repo"**, paste:
+**From the Sine store** (recommended): in Zen, open **Sine → Marketplace**, search **Zen Page Tint**, and install. Enable it and restart Zen — updates then land automatically.
 
-```
-https://github.com/caezium/zen-page-tint
-```
+**Or add it locally from this repo:** Sine settings → **"Add your own locally from a GitHub repo"** → paste `https://github.com/caezium/zen-page-tint` → enable → restart. A local (unvetted) install also needs `sine.allow-unsafe-js = true` in `about:config` for the script portion to load.
 
-Enable in Sine, restart Zen.
-
-> Until this is on the Sine store you'll need `sine.allow-unsafe-js = true` in `about:config` for the script portion to load. (That's Sine's safety gate — the script only reads the current page's background color via a content-script bridge: no network calls, no external data.)
+> **No network calls, no telemetry** — the script only reads the current page's background color locally via a content-script bridge; no external data leaves your machine.
 
 ## Configuration
 
