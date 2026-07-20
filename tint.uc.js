@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Zen Page Tint
 // @description    Adaptive Zen chrome color from the active page
-// @version        1.5.1
+// @version        1.5.3
 // ==/UserScript==
 
 (() => {
@@ -64,7 +64,9 @@
   //     color. Done as an overlay (not a solid color blend) precisely because a
   //     workspace gradient is a gradient, not a single color, so it can't be
   //     reproduced by mixing one color — see style.css --zpt-tint / the rim rule.
-  //   zen.page-tint.frame-gap    (int px, default 5)   → --zpt-frame-gap
+  //   zen.page-tint.frame-gap    (int px, default 5) → --zpt-frame-gap
+  //     Non-compact only: compact mode stays flush so Zen's screen-edge hover
+  //     targets remain reachable.
   //   zen.page-tint.frame-radius (int px, default 14)  → --zpt-frame-radius
   //   zen.page-tint.saturation   (int 0..200, default 100)
   //     Scales the sampled color's HSL saturation before it's applied. 0 =
@@ -115,6 +117,7 @@
   const MESSAGE_NAME = 'zen-page-tint:theme';
   const CONFIG_MESSAGE_NAME = 'zen-page-tint:config';
   const TEARDOWN_MESSAGE_NAME = 'zen-page-tint:teardown';
+  const GLANCE_TAB_ATTRIBUTE = 'zen-glance-tab';
   const FRAME_SCRIPT_URL = 'chrome://sine/content/zen-page-tint/frame.js';
   const root = document.documentElement;
 
@@ -280,6 +283,15 @@
   // restored tabs with no listener at all).
   const browserState = new WeakMap();
 
+  // A transient Zen Glance is selected like a normal browser, but Zen still shows
+  // its parent page behind the overlay. Keep the shared chrome on the parent's
+  // tint until the child is expanded into a normal tab, at which point Zen removes
+  // this attribute and the observer below samples the child normally.
+  function isTransientGlance(browser) {
+    try { return gBrowser.getTabForBrowser(browser)?.hasAttribute(GLANCE_TAB_ATTRIBUTE) === true; }
+    catch { return false; }
+  }
+
   function makeListener(browser) {
     return (msg) => {
       const theme = msg.data || {};
@@ -291,15 +303,16 @@
       if (isInternalUrl(sampled) || hostMatches(sampled, DISABLE_HOSTS)) return;
       const key = cacheKey(sampled);
       const isCurrent = cacheKey(current) === key;
+      const canApply = isCurrent && gBrowser.selectedBrowser === browser && !isTransientGlance(browser);
       log('message received', { source: theme.source, bg: theme.bg, url: sampled });
 
       if (theme.bg) {
         cacheSet(key, theme.bg);
-        if (isCurrent && gBrowser.selectedBrowser === browser) {
+        if (canApply) {
           applyTheme(theme.bg);
           log('applied', { bg: theme.bg });
         }
-      } else if (isCurrent && gBrowser.selectedBrowser === browser) {
+      } else if (canApply) {
         // Genuine "no color found" on the page currently shown — drop the stale
         // cache entry and clear the tint (otherwise the previous page's tint
         // lingers on a colorless / transparent page). Gated on selected+current so
@@ -388,6 +401,10 @@
 
   function sampleAndApply(browser, forceFresh = false) {
     if (!browser) return;
+    if (isTransientGlance(browser)) {
+      log('transient Glance selected; preserving parent tint');
+      return;
+    }
     const url = browser.currentURI?.spec || '';
 
     // Internal pages and per-site-disabled hosts keep Zen's own chrome (no tint).
@@ -454,6 +471,22 @@
   const onTabClose = (evt) => { const browser = evt.target?.linkedBrowser; if (browser) detachBrowser(browser); };
   gBrowser.tabContainer.addEventListener('TabSelect', onTabSelect);
   gBrowser.tabContainer.addEventListener('TabClose', onTabClose);
+
+  // Expanding a Glance removes zen-glance-tab without necessarily selecting a
+  // different tab, so TabSelect alone cannot hand tint ownership to the child.
+  // Observe only that one attribute and sample once it disappears from the
+  // currently selected tab. Opening/closing Glance still uses the normal guards
+  // and TabSelect path.
+  const glanceObserver = new MutationObserver((records) => {
+    const selectedTab = gBrowser.selectedTab;
+    if (!selectedTab || selectedTab.hasAttribute(GLANCE_TAB_ATTRIBUTE)) return;
+    if (records.some((record) => record.target === selectedTab)) scheduleSample(false);
+  });
+  glanceObserver.observe(gBrowser.tabContainer, {
+    attributes: true,
+    attributeFilter: [GLANCE_TAB_ATTRIBUTE],
+    subtree: true,
+  });
 
   // onLocationChange: top-level navigation/reload in active tab — bypass cache.
   const progressListener = {
@@ -526,6 +559,7 @@
     try { gBrowser.removeProgressListener(progressListener); } catch {}
     try { gBrowser.tabContainer.removeEventListener('TabSelect', onTabSelect); } catch {}
     try { gBrowser.tabContainer.removeEventListener('TabClose', onTabClose); } catch {}
+    try { glanceObserver.disconnect(); } catch {}
     try {
       if (colorSchemeQuery && onColorSchemeChange) colorSchemeQuery.removeEventListener('change', onColorSchemeChange);
     } catch {}

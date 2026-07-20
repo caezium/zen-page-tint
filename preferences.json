@@ -60,7 +60,7 @@
     "type": "string",
     "value": "number",
     "property": "zen.page-tint.frame-gap",
-    "label": "Frame gap (px): space between the content area and the window edge.",
+    "label": "Frame gap (px): non-compact mode only. Compact mode stays flush so edge-hover controls keep working.",
     "defaultValue": 5,
     "placeholder": "5"
   },

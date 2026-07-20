@@ -55,6 +55,14 @@
     box-shadow: none !important;
   }
 
+  /* Zen deliberately lets the window-button box overflow the content wrapper
+     in these two collapsed-sidebar layouts. Keep the inner browser panels
+     clipped for the rounded frame, but don't clip the controls at the wrapper. */
+  &[zen-right-side="true"]:not([zen-compact-mode="true"]):not([zen-sidebar-expanded="true"]):not([zen-window-buttons-reversed="true"]) #zen-appcontent-wrapper,
+  &:not([zen-right-side="true"]):not([zen-compact-mode="true"]):not([zen-sidebar-expanded="true"])[zen-window-buttons-reversed="true"] #zen-appcontent-wrapper {
+    overflow: visible;
+  }
+
   &[chromehidden~="toolbar"],
   &:has(#navigator-toolbox[tabs-hidden]) {
     #zen-appcontent-wrapper {
@@ -234,6 +242,19 @@
       box-shadow: none !important;
     }
 
+    /* Compact mode puts an opaque, scheme-colored backdrop over the tinted
+       toolbox/topbar. Make that visual layer transparent so the already-tinted
+       parent surface remains visible; retain Zen's own radius, outline and
+       floating shadow. Acrylic's brightness filter would darken the tint too. */
+    &[zen-compact-mode="true"] .zen-toolbar-background {
+      background: transparent !important;
+      backdrop-filter: none !important;
+    }
+    &[zen-compact-mode="true"] .zen-toolbar-background::before,
+    &[zen-compact-mode="true"] .zen-toolbar-background::after {
+      background: transparent !important;
+    }
+
     /* Single-toolbar mode: the sidebar's forced foreground (above) is inherited by
        the urlbar, but when it breaks out into its own dark floating results panel
        that page-derived color can be invisible. Pin the broken-out panel's text to
@@ -293,6 +314,15 @@
       background-color: Canvas !important;
     }
 
+    /* A Glance overlay container fills the whole content area, while its child
+       browser is intentionally only 80% wide. An opaque Canvas background here
+       covers the dimmed parent page in the remaining 20%, making the parent look
+       as if Zen removed it. Keep the overlay transparent so the parent can show
+       through around the child. */
+    .browserSidebarContainer.zen-glance-overlay {
+      background-color: transparent !important;
+    }
+
     /* Tint ring filling the frame gap around the content. Applied ONLY to
        .browserSidebarContainer, never #navigator-toolbox: the toolbox sits
        outside the content wrapper's overflow:hidden, so a box-shadow on it
@@ -309,7 +339,7 @@
        oscillate between the toolbar and the page — the "twitch" (#11). Leaving the
        container's overflow at Zen's default keeps the content clipped where it
        belongs and the ring still paints. */
-    &:not([zen-compact-mode="true"]) .browserSidebarContainer {
+    &:not([zen-compact-mode="true"]) .browserSidebarContainer:not(.zen-glance-background):not(.zen-glance-overlay) {
       box-shadow: 0 0 0 var(--zpt-frame-gap) var(--zpt-tint, var(--zen-tab-header-background, var(--zen-main-browser-background))) !important;
     }
 
@@ -414,13 +444,19 @@
  * smooth fade is kept and the scroll-time hitch is accepted as a tradeoff — tune
  * live-mode rate/threshold down if it bothers you.
  */
-/* Guarded to NON-compact mode: in compact mode Zen reveals this top toolbar by
-   animating its `height` (collapsed strip → full bar on hover). Our `transition`
-   shorthand with !important would replace that whole property and the topbar
-   would snap open/closed with no slide. Outside compact mode the toolbar is
-   always shown, so smoothing its bg/text color is safe and wanted. (#11) */
+/* Outside compact mode the toolbar is always shown, so only tint properties
+   need transitions. Compact mode gets a merged transition below. */
 :root[zen-page-tint-active="on"]:not([zen-compact-mode="true"]) #zen-appcontent-navbar-wrapper {
   transition: background-color var(--zpt-live-smoothing-ms, 1000ms) ease-out,
+              color var(--zpt-live-smoothing-ms, 1000ms) ease-out !important;
+}
+
+/* Preserve Zen's compact reveal animations while also fading the tinted parent
+   surfaces that now show through .zen-toolbar-background. A transition
+   shorthand replaces the whole list, so every native property is repeated. */
+:root[zen-page-tint-active="on"][zen-compact-mode="true"] #zen-appcontent-navbar-wrapper {
+  transition: height var(--zen-hidden-toolbar-transition),
+              background-color var(--zpt-live-smoothing-ms, 1000ms) ease-out,
               color var(--zpt-live-smoothing-ms, 1000ms) ease-out !important;
 }
 
@@ -447,15 +483,21 @@
     }
 
     /* #navigator-toolbox (the sidebar) and #titlebar carry Zen's compact-mode
-       reveal animations: the toolbox slides in/out via `left`/`right` and the
-       titlebar toggles `visibility`. Our bg-color `transition` shorthand with
-       !important replaces the whole transition property, so applying it here
-       would kill those slides — the sidebar/topbar would appear and disappear
-       with no animation. So smooth their color only OUTSIDE compact mode and let
-       Zen own the transition in compact mode (an instant bg-color swap on the
-       thin floating bar is imperceptible). (#11) */
+       reveal animations, so their compact transition lists are merged below. */
     &:not([zen-compact-mode="true"]) :is(#navigator-toolbox, #titlebar) {
       transition: background-color var(--zpt-live-smoothing-ms, 1000ms) ease-out !important;
+    }
+
+    &[zen-compact-mode="true"] #navigator-toolbox:not([animate="true"]) {
+      transition: left 0.15s ease,
+                  right 0.15s ease,
+                  visibility 0.15s ease,
+                  background-color var(--zpt-live-smoothing-ms, 1000ms) ease-out !important;
+    }
+
+    &[zen-compact-mode="true"] #navigator-toolbox:not([animate="true"]) #titlebar {
+      transition: visibility 0.15s,
+                  background-color var(--zpt-live-smoothing-ms, 1000ms) ease-out !important;
     }
 
     /* Belt-and-suspenders: explicitly suppress any transition on tab elements

@@ -53,7 +53,7 @@ Everything is configurable from the **Sine settings panel** for this mod (Zen �
 | `zen.page-tint.min-lightness` | `0` | Lightness **floor** (0–100): keeps near-black pages from making the chrome muddy. `0` = no floor. |
 | `zen.page-tint.max-lightness` | `100` | Lightness **cap** (0–100): keeps blinding-white pages from washing the chrome out. `100` = no cap. |
 | `zen.page-tint.disable-hosts` | `''` | Comma-separated host list (same syntax as `live-mode-hosts`, supports `*.example.com`) where the tint is turned **off** — the chrome keeps your Zen theme on those sites. |
-| `zen.page-tint.frame-gap` | `5` | Gap (px) between the content area and the window edge. |
+| `zen.page-tint.frame-gap` | `5` | Gap (px) between the content area and the window edge in non-compact mode. Compact mode stays flush so Zen's screen-edge hover controls remain reachable. Extremely large values can push the page viewport entirely offscreen. |
 | `zen.page-tint.frame-radius` | `14` | Content corner radius (px). |
 
 **Need a restart** (read once at load):
@@ -86,6 +86,7 @@ The `--zpt-frame-shadow` drop shadow is still a CSS knob in `style.css` `:root` 
 4. Cache miss → loads `frame.js` into the content process. Frame script samples + observes mutations, and pushes updates via `sendAsyncMessage`.
 5. Cache is bounded LRU (3000 entries) keyed by `origin + pathname`. Cleared on OS color-scheme change so prefers-color-scheme-aware sites re-sample fresh.
 6. Sampled color is adjusted (saturation / lightness clamp) and the foreground (black or white) is picked against the result via Rec 601 luminance for max contrast.
+7. A transient Zen Glance keeps its parent tab's tint while the parent remains visible behind it. Expanding the Glance into a normal tab hands tint ownership to the child and samples it normally.
 
 **`frame.js`** runs in the content process. Sample chain (first match wins):
 1. **`drawWindow` pixel of the central 60% of the viewport, downsampled to a 16×16 grid and averaged** — ground truth of what's actually painted, weighted to the dominant central tone rather than whatever single element lands dead-center. Picks up Zen Boost overlays, dark-mode toggles, Gmail-class apps where `<body>` lies about the visible color.
