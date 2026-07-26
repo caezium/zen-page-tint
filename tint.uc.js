@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Zen Page Tint
 // @description    Adaptive Zen chrome color from the active page
-// @version        1.5.3
+// @version        2.0.0
 // ==/UserScript==
 
 (() => {
@@ -27,9 +27,12 @@
   //   zen.page-tint.live-mode               (bool, default true)
   //     Master switch. When off, no polling at all (pure event-driven).
   //   zen.page-tint.live-mode-rate-ms       (int, default 2000 — 0.5 Hz)
-  //     The IDLE/ceiling poll interval. Sampling is adaptive: while the page
-  //     color is actively changing we poll faster (down to rate/4, floored at
-  //     250ms / 4 Hz), then back off to this rate once the color is stable.
+  //     The poll interval, used verbatim (floored at 100ms as a guard against an
+  //     absurd value). This is the rate at which the chrome color can change.
+  //     Sampling used to adaptively run at rate/4 on changing content, which meant
+  //     video pinned it there permanently and this number never actually applied —
+  //     see the frame script. How MUCH change is needed to re-tint is a separate
+  //     knob (live-mode-threshold); this one is purely cadence.
   //   zen.page-tint.live-mode-threshold     (int, default 8 — 0..255)
   //     Minimum per-channel color change required to actually re-tint. Below this
   //     is ignored so the chrome doesn't churn. Set 0 to re-tint on any change.
@@ -50,6 +53,29 @@
   const LIVE_ALWAYS_ON = prefBool('zen.page-tint.live-mode-always-on', false);
   const LIVE_HOSTS_RAW = prefStr('zen.page-tint.live-mode-hosts', '');
   const LIVE_THRESHOLD = prefInt('zen.page-tint.live-mode-threshold', 8);
+
+  // Color-source prefs. Both are pushed to the frame script with the rest of the
+  // config, and both are live-applicable (the observer below clears the cache and
+  // re-samples), so they can be A/B'd without a restart.
+  //
+  //   zen.page-tint.youtube-ambient  (bool, default true)
+  //     On YouTube, sample the video's own painted picture box instead of a
+  //     centered viewport grab, gated on the player's Ambient mode being on. Same
+  //     frames YouTube's on-screen glow is built from, minus what a viewport grab
+  //     drags in — letterbox bars on a 21:9 video, page chrome, the comments
+  //     column. (It reads the compositor via drawWindow, not YouTube's own
+  //     #cinematics canvas: that canvas is CORS-tainted by the cross-origin video
+  //     stream and throws on read. See the frame-script comment.) With Ambient mode
+  //     off we fall through to the normal sample chain.
+  //   zen.page-tint.light-average    (bool, default false)
+  //     Average PAGE samples as light rather than as flat color: decode sRGB to
+  //     linear before averaging and weight vivid cells above gray ones. More
+  //     accurate physically, and noticeably brighter/more saturated on mixed
+  //     pages — a mostly-dark page with bright content on it stops reading as
+  //     dark, which is why it's off by default. The YouTube ambient path always
+  //     uses this model regardless, since there it's modelling actual light.
+  let YT_AMBIENT = prefBool('zen.page-tint.youtube-ambient', true);
+  let LIGHT_AVERAGE = prefBool('zen.page-tint.light-average', false);
 
   // CSS-side appearance knobs. Unlike the live-mode prefs (read once at
   // frame-script load, so they need a restart), these only drive CSS variables,
@@ -80,11 +106,37 @@
   //     Comma-separated host list (same syntax as live-mode-hosts, supports
   //     *.example.com) where the tint is turned OFF entirely — the chrome keeps
   //     your Zen theme on those sites.
+  //   zen.page-tint.brightness   (int 0..300, default 100)
+  //     Gain on the sampled color's lightness, applied BEFORE the min/max clamp so
+  //     those stay hard bounds. 100 = untouched, 200 = twice as light. Operates on
+  //     HSL lightness rather than multiplying RGB channels, so it can't shift hue
+  //     or clip one channel before the others.
+  //   zen.page-tint.contrast     (int 0..300, default 100)
+  //     Pushes lightness away from (or toward) mid-grey: 100 = untouched, 200
+  //     doubles the distance from 50%, 0 flattens everything to mid-grey. Note this
+  //     acts on the single already-averaged color, so it deepens darks and lifts
+  //     lights — it cannot add local contrast the way a filter on an image would.
+  //   zen.page-tint.ambient-spread (int 0..100, default 0)
+  //     Strength of the DIRECTIONAL gradient. The sampler already reduces the
+  //     viewport to a 16x16 grid; this exposes the per-edge colors that the flat
+  //     average was discarding, laid over the base tint as a gradient so the left
+  //     of the chrome takes its color from the left of the page and so on. 0 = off
+  //     (flat tint, exactly as before, and the frame script skips the extra work);
+  //     100 = strongest. This is the analogue of the userstyle's scale + blur, done
+  //     as chrome geometry instead of a GPU blur pass.
   const clampInt = (n, lo, hi) => Math.max(lo, Math.min(hi, n | 0));
   let MIX_AMOUNT = clampInt(prefInt('zen.page-tint.mix-amount', 100), 0, 100);
   let SATURATION = clampInt(prefInt('zen.page-tint.saturation', 100), 0, 200);
   let MIN_LIGHT = clampInt(prefInt('zen.page-tint.min-lightness', 0), 0, 100);
   let MAX_LIGHT = clampInt(prefInt('zen.page-tint.max-lightness', 100), 0, 100);
+  let BRIGHTNESS = clampInt(prefInt('zen.page-tint.brightness', 100), 0, 300);
+  let CONTRAST = clampInt(prefInt('zen.page-tint.contrast', 100), 0, 300);
+  let AMBIENT_SPREAD = clampInt(prefInt('zen.page-tint.ambient-spread', 0), 0, 100);
+  // Ceiling on the gradient overlay's alpha. Full opacity would let an edge color
+  // completely replace the base tint at the extremes, which breaks the readable-
+  // foreground pick (that's computed against the base). Capping keeps the endpoints
+  // tethered to the base so text contrast survives at any spread.
+  const EDGE_ALPHA_MAX = 0.7;
 
   // Host-pattern matching. Supports exact-host and leading-wildcard patterns
   // ('*.example.com' matches 'foo.example.com' but not 'example.com'). Matched
@@ -117,6 +169,14 @@
   const MESSAGE_NAME = 'zen-page-tint:theme';
   const CONFIG_MESSAGE_NAME = 'zen-page-tint:config';
   const TEARDOWN_MESSAGE_NAME = 'zen-page-tint:teardown';
+  // The frame script sends this once its listeners are live; we answer with
+  // config. loadFrameScript() + an immediate sendConfig() races on a process's
+  // first load — the message manager drops messages aimed at listeners that
+  // aren't registered yet — and the failure is silent, leaving live mode off with
+  // liveRateMs stuck at 0. Keeping the eager send too means the common case
+  // (process already running the script) still gets config with no extra round
+  // trip; this handshake only has to cover the cold start.
+  const READY_MESSAGE_NAME = 'zen-page-tint:ready';
   const GLANCE_TAB_ATTRIBUTE = 'zen-glance-tab';
   const FRAME_SCRIPT_URL = 'chrome://sine/content/zen-page-tint/frame.js';
   const root = document.documentElement;
@@ -197,19 +257,37 @@
     };
   }
 
-  // Apply the saturation scale and lightness clamp to a sampled color. Fast-paths
-  // out when nothing is configured (the common case) so default users pay nothing.
+  // Apply saturation, brightness, contrast, then the lightness clamp to a sampled
+  // color. Order matters: gain and contrast run first so the clamp stays a hard
+  // bound on the final result rather than something a later multiply can escape.
+  // Fast-paths out when nothing is configured (the common case) so default users
+  // pay nothing.
   function transformColor(bg) {
-    if (SATURATION === 100 && MIN_LIGHT === 0 && MAX_LIGHT === 100) return bg;
+    if (SATURATION === 100 && BRIGHTNESS === 100 && CONTRAST === 100
+      && MIN_LIGHT === 0 && MAX_LIGHT === 100) return bg;
     const rgb = parseRgb(bg);
     if (!rgb) return bg;
+    const unit = (n) => Math.max(0, Math.min(1, n));
     const hsl = rgbToHsl(rgb.r, rgb.g, rgb.b);
-    hsl.s = Math.max(0, Math.min(1, hsl.s * (SATURATION / 100)));
+    hsl.s = unit(hsl.s * (SATURATION / 100));
+    if (BRIGHTNESS !== 100) hsl.l = unit(hsl.l * (BRIGHTNESS / 100));
+    if (CONTRAST !== 100) hsl.l = unit(0.5 + (hsl.l - 0.5) * (CONTRAST / 100));
     const lo = Math.min(MIN_LIGHT, MAX_LIGHT) / 100;
     const hi = Math.max(MIN_LIGHT, MAX_LIGHT) / 100;
     hsl.l = Math.max(lo, Math.min(hi, hsl.l));
     const out = hslToRgb(hsl.h, hsl.s, hsl.l);
     return `rgb(${out.r}, ${out.g}, ${out.b})`;
+  }
+
+  // Turn a transformed edge color into the translucent overlay stop CSS consumes.
+  // Alpha carries the spread strength, so the compositor does the base↔edge blend
+  // and JS never has to lerp — and at spread 0 the attribute gate below removes the
+  // gradient rules entirely rather than painting a no-op.
+  function edgeStop(color) {
+    const rgb = parseRgb(color);
+    if (!rgb) return null;
+    const alpha = (AMBIENT_SPREAD / 100) * EDGE_ALPHA_MAX;
+    return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${alpha.toFixed(3)})`;
   }
 
   // Push the CSS-var appearance prefs into their variables, overriding the
@@ -227,37 +305,80 @@
   // applied here; the overlay OPACITY is handled in CSS by --zpt-strength; and the
   // readable foreground is picked against the ADJUSTED color so contrast stays
   // correct.
-  function renderTint(rawBg) {
+  const EDGE_VARS = { l: '--zpt-edge-l', r: '--zpt-edge-r', t: '--zpt-edge-t', b: '--zpt-edge-b' };
+
+  function clearEdgeVars() {
+    for (const name of Object.values(EDGE_VARS)) root.style.removeProperty(name);
+    root.removeAttribute('zen-page-tint-ambient');
+  }
+
+  function renderTint(rawBg, rawEdges) {
     if (rawBg && MIX_AMOUNT > 0) {
       const tint = transformColor(rawBg);
       const fg = readableFg(tint) || 'inherit';
       root.style.setProperty('--zen-tab-header-background', tint);
       root.style.setProperty('--zen-tab-header-foreground', fg);
       root.setAttribute('zen-page-tint', 'on');
+
+      // Directional gradient. Edge colors go through the SAME transform as the
+      // base so a saturation or brightness change moves all of them together —
+      // otherwise the gradient would drift out of family with the surface it sits
+      // on. The attribute gates the CSS: without it there is no gradient rule at
+      // all, so spread 0 costs nothing rather than painting a transparent one.
+      if (AMBIENT_SPREAD > 0 && rawEdges) {
+        let ok = true;
+        const stops = {};
+        for (const key of Object.keys(EDGE_VARS)) {
+          const stop = rawEdges[key] ? edgeStop(transformColor(rawEdges[key])) : null;
+          if (!stop) { ok = false; break; }
+          stops[key] = stop;
+        }
+        if (ok) {
+          for (const [key, name] of Object.entries(EDGE_VARS)) root.style.setProperty(name, stops[key]);
+          root.setAttribute('zen-page-tint-ambient', 'on');
+        } else {
+          clearEdgeVars();
+        }
+      } else {
+        clearEdgeVars();
+      }
     } else {
       root.style.removeProperty('--zen-tab-header-background');
       root.style.removeProperty('--zen-tab-header-foreground');
       root.removeAttribute('zen-page-tint');
+      clearEdgeVars();
     }
   }
 
-  // Track the last applied (raw) color so switching between
-  // same-colored tabs (the common case — most pages are white or one of a few
-  // grays) doesn't rewrite the CSS variables and trigger a full restyle of every
-  // var() consumer (including the per-tab rules × thousands of tabs) plus a
-  // re-armed 1s fade.
-  let lastAppliedBg = undefined;
-  function applyTheme(bg) {
-    const next = bg || null;
-    if (next === lastAppliedBg) return;
-    lastAppliedBg = next;
-    renderTint(next);
+  // Track the last applied (raw) theme so switching between same-colored tabs (the
+  // common case — most pages are white or one of a few grays) doesn't rewrite the
+  // CSS variables and trigger a full restyle of every var() consumer (including the
+  // per-tab rules × thousands of tabs) plus a re-armed 1s fade. Compared by
+  // signature rather than identity because the theme is now an object rebuilt on
+  // every message, so `===` would never match and the dedupe would be dead.
+  let lastAppliedTheme = null;
+  let lastAppliedSig = undefined;
+  function themeSig(theme) {
+    if (!theme || !theme.bg) return null;
+    const e = theme.edges;
+    return e ? `${theme.bg}|${e.l}|${e.r}|${e.t}|${e.b}` : theme.bg;
+  }
+  function applyTheme(theme) {
+    const next = (theme && theme.bg) ? theme : null;
+    const sig = themeSig(next);
+    if (sig === lastAppliedSig) return;
+    lastAppliedSig = sig;
+    lastAppliedTheme = next;
+    renderTint(next && next.bg, next && next.edges);
   }
 
-  // Re-render from the last raw color without the same-color dedupe. Used when an
-  // appearance pref (strength / saturation / lightness) changes live: the raw page
-  // color is unchanged but its rendered result isn't.
-  function reapplyTint() { renderTint(lastAppliedBg ?? null); }
+  // Re-render from the last raw theme without the same-color dedupe. Used when an
+  // appearance pref (strength / saturation / brightness / contrast / lightness /
+  // spread) changes live: the raw page color is unchanged but its rendered result
+  // isn't.
+  function reapplyTint() {
+    renderTint(lastAppliedTheme && lastAppliedTheme.bg, lastAppliedTheme && lastAppliedTheme.edges);
+  }
 
   function cacheKey(uri) {
     try { const u = new URL(uri); return u.origin + u.pathname; }
@@ -307,10 +428,13 @@
       log('message received', { source: theme.source, bg: theme.bg, url: sampled });
 
       if (theme.bg) {
-        cacheSet(key, theme.bg);
+        // Cache the whole sampled theme (color + directional edges), not just the
+        // color: a cache hit has to be able to restore the gradient too, or
+        // revisiting a tab would silently drop to a flat tint.
+        cacheSet(key, { bg: theme.bg, edges: theme.edges || null });
         if (canApply) {
-          applyTheme(theme.bg);
-          log('applied', { bg: theme.bg });
+          applyTheme({ bg: theme.bg, edges: theme.edges || null });
+          log('applied', { bg: theme.bg, edges: !!theme.edges });
         }
       } else if (canApply) {
         // Genuine "no color found" on the page currently shown — drop the stale
@@ -324,6 +448,15 @@
     };
   }
 
+  // Drop both message listeners recorded for a browser. Shared so the two removal
+  // sites (stale-mm re-attach, and detach on TabClose / cleanup) can't drift apart
+  // and leak one listener — which is what a hand-rolled second copy invites.
+  function removeListeners(rec) {
+    if (!rec || !rec.mm) return;
+    if (rec.listener) { try { rec.mm.removeMessageListener(MESSAGE_NAME, rec.listener); } catch {} }
+    if (rec.readyListener) { try { rec.mm.removeMessageListener(READY_MESSAGE_NAME, rec.readyListener); } catch {} }
+  }
+
   // Attach (or re-attach) the chrome-side message listener for a browser. Returns
   // the record, or null if no message manager is available.
   function ensureAttached(browser) {
@@ -334,11 +467,13 @@
     if (rec && rec.mm === mm) return rec;
     // New browser, or the mm was recreated under us — drop any stale listener and
     // attach to the live mm.
-    if (rec && rec.mm && rec.listener) {
-      try { rec.mm.removeMessageListener(MESSAGE_NAME, rec.listener); } catch {}
-    }
+    removeListeners(rec);
     const listener = makeListener(browser);
-    try { mm.addMessageListener(MESSAGE_NAME, listener); }
+    const readyListener = () => { log('frame script ready; pushing config'); sendConfig(browser); };
+    try {
+      mm.addMessageListener(MESSAGE_NAME, listener);
+      mm.addMessageListener(READY_MESSAGE_NAME, readyListener);
+    }
     catch (e) {
       // Drop any stale record so the next attempt retries cleanly, rather than
       // leaving a record with loaded:true that makes the cache-hit path skip the
@@ -347,23 +482,31 @@
       browserState.delete(browser);
       return null;
     }
-    rec = { mm, listener, loaded: false };
+    rec = { mm, listener, readyListener, loaded: false };
     browserState.set(browser, rec);
     log('listener attached');
     return rec;
   }
 
+  // Config is sent unconditionally — the live-mode master switch is expressed as
+  // liveRateMs: 0 (which the frame script already treats as "never poll") rather
+  // than by skipping the message. Bailing early here would also starve the
+  // non-live settings below it, silently pinning them to the frame script's
+  // built-in defaults for anyone running with live mode off.
   function sendConfig(browser) {
-    if (!LIVE_MODE) return;
     const mm = browser.messageManager;
     if (!mm?.sendAsyncMessage) return;
     try {
       const url = browser.currentURI?.spec || '';
       mm.sendAsyncMessage(CONFIG_MESSAGE_NAME, {
-        liveRateMs: LIVE_RATE_MS,
+        liveRateMs: LIVE_MODE ? LIVE_RATE_MS : 0,
         alwaysOn: LIVE_ALWAYS_ON || hostMatches(url, LIVE_HOSTS),
         threshold: LIVE_THRESHOLD,
         debug: DEBUG,
+        ytAmbient: YT_AMBIENT,
+        lightAverage: LIGHT_AVERAGE,
+        // Only ask for per-edge colors when something will actually render them.
+        edges: AMBIENT_SPREAD > 0,
       });
     } catch (e) { log('config message send failed', e); }
   }
@@ -385,10 +528,7 @@
 
   function detachBrowser(browser) {
     if (!browser) return;
-    const rec = browserState.get(browser);
-    if (rec && rec.mm && rec.listener) {
-      try { rec.mm.removeMessageListener(MESSAGE_NAME, rec.listener); } catch {}
-    }
+    removeListeners(browserState.get(browser));
     browserState.delete(browser);
     log('detached');
   }
@@ -539,6 +679,36 @@
           MAX_LIGHT = clampInt(prefInt('zen.page-tint.max-lightness', 100), 0, 100);
           reapplyTint();
           break;
+        case 'zen.page-tint.brightness':
+          BRIGHTNESS = clampInt(prefInt('zen.page-tint.brightness', 100), 0, 300);
+          reapplyTint();
+          break;
+        case 'zen.page-tint.contrast':
+          CONTRAST = clampInt(prefInt('zen.page-tint.contrast', 100), 0, 300);
+          reapplyTint();
+          break;
+        case 'zen.page-tint.ambient-spread': {
+          const wasOn = AMBIENT_SPREAD > 0;
+          AMBIENT_SPREAD = clampInt(prefInt('zen.page-tint.ambient-spread', 0), 0, 100);
+          // Crossing the 0 boundary flips whether the frame script computes edges at
+          // all, so cached entries are now the wrong shape. Within a non-zero range
+          // only the overlay alpha changes, which is a pure re-render.
+          //
+          // Clearing the cache is the ONLY propagation needed: every tab becomes a
+          // miss, and the miss path already calls loadFrameScript() → sendConfig().
+          // Do NOT iterate gBrowser.browsers to push config eagerly — that touches
+          // .messageManager on every tab, which instantiates lazy session-restore
+          // browsers and floods IPC. At this project's target tab counts it hangs the
+          // window outright (observed at ~1660 tabs). scheduleSample handles the tab
+          // the user is actually looking at; the rest fix themselves on select.
+          if (wasOn !== (AMBIENT_SPREAD > 0)) {
+            themeCache.clear();
+            scheduleSample(true);
+          } else {
+            reapplyTint();
+          }
+          break;
+        }
         case 'zen.page-tint.disable-hosts':
           DISABLE_HOSTS = parseHostList(prefStr('zen.page-tint.disable-hosts', ''));
           scheduleSample(false); // re-evaluate the active tab (clear or restore)
@@ -546,6 +716,18 @@
         case 'zen.page-tint.frame-gap':
         case 'zen.page-tint.frame-radius':
           applyCssVarPrefs();
+          break;
+        // Color-source changes invalidate every cached sample, since the cache
+        // stores the resulting color rather than the pixels it came from. Clear
+        // and force a fresh sample — same treatment as an OS color-scheme flip.
+        // Other tabs re-sample on their next select, which is now a cache miss and
+        // therefore reloads the frame script (re-pushing this config with it).
+        case 'zen.page-tint.youtube-ambient':
+        case 'zen.page-tint.light-average':
+          YT_AMBIENT = prefBool('zen.page-tint.youtube-ambient', true);
+          LIGHT_AVERAGE = prefBool('zen.page-tint.light-average', false);
+          themeCache.clear();
+          scheduleSample(true);
           break;
       }
     },
@@ -567,11 +749,26 @@
     try { if (scheduleRafId) cancelAnimationFrame(scheduleRafId); } catch {}
     try { if (scheduleTimerId) clearTimeout(scheduleTimerId); } catch {}
     scheduled = false;
-    // Detach every open browser's listener and tell its content process to tear
-    // down (stop observers / polling). Iterates live browsers because the
-    // per-browser WeakMap isn't enumerable; closed tabs already detached on
-    // TabClose.
-    try { for (const browser of gBrowser.browsers) { detachBrowser(browser); sendTeardown(browser); } } catch {}
+    // Detach each browser's listener and tell its content process to tear down
+    // (stop observers / polling). Iterates live browsers because the per-browser
+    // WeakMap isn't enumerable; closed tabs already detached on TabClose.
+    //
+    // Skips lazy (unrestored) tabs via tab.linkedPanel, which is tabbrowser.js's own
+    // "browser is inserted" idiom. Reading .messageManager on a lazy browser trips
+    // the property trap that calls _insertBrowser() — messageManager is not on the
+    // safe-while-lazy list — so an unguarded sweep instantiates every restored-
+    // session tab just to tear it down. At 1600+ tabs that's a multi-second hang on
+    // window close or mod hot-reload. A lazy tab never ran the frame script and never
+    // had a listener attached, so there is nothing there to clean up anyway.
+    try {
+      for (const tab of gBrowser.tabs) {
+        if (!tab.linkedPanel) continue;
+        const browser = tab.linkedBrowser;
+        if (!browser) continue;
+        detachBrowser(browser);
+        sendTeardown(browser);
+      }
+    } catch {}
     applyTheme(null);
     root.removeAttribute('zen-page-tint-active');
     root.removeAttribute('zen-page-tint-live');

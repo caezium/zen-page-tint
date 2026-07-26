@@ -90,6 +90,19 @@
     transition: background-color 100ms linear;
   }
 
+  /* Horizontal half of the directional gradient — see the ambient block further
+     down for the reasoning. This strip is wide and short, so it takes the left/right
+     pair; the tall sidebar takes top/bottom. Has no .tabbrowser-tab descendants, so
+     unlike the tab-strip surfaces it's free to carry a gradient. */
+  &[zen-page-tint-ambient="on"] #zen-appcontent-navbar-wrapper {
+    background-image: linear-gradient(
+      to right,
+      var(--zpt-edge-l, transparent),
+      transparent 50%,
+      var(--zpt-edge-r, transparent)
+    );
+  }
+
   /* URL input text — explicitly follow the foreground so the URL is readable
      when the page bg is very light (black text on white) or very dark (white on dark).
      Without this, Zen's defaults stay gray and the URL goes nearly invisible.
@@ -202,14 +215,38 @@
       box-shadow: inset 0 0 0 100vmax var(--zpt-tint) !important;
     }
 
+    /* ---------- One tint layer per pixel ----------
+       --zpt-tint is TRANSLUCENT below 100% strength, and translucent layers
+       composite: painting it on an element AND on that element's ancestor stacks
+       to 1-(1-s)^depth, not s. Zen's chrome is deeply nested —
+         #main-window > #browser > #navigator-toolbox > #titlebar > #TabsToolbar
+         > #zen-sidebar-foot-buttons
+       — so at 50% strength the window rim rendered 50% tint while the sidebar
+       foot buttons rendered 96.9%, and every surface in between landed somewhere
+       different. That's the "colors aren't uniform below 100%" bug (#14): not a
+       wrong color anywhere, just the same color applied a different number of
+       times per region.
+       Fix: exactly one element paints the tint over any given pixel. Elements
+       that merely CONTAIN a tinted surface are set transparent below — they still
+       override Zen's own background (so its opaque chrome color is suppressed
+       just as before), they just stop adding another coat.
+       At 100% strength --zpt-tint is fully opaque, where stacking is a no-op, so
+       the default look is byte-identical to before. */
+
     /* `&` is the root element (= #main-window). A nested `#main-window` selector
        desugars to ":root[zen-page-tint=on] #main-window" — #main-window as a
        descendant of itself — which never matches, so it was previously dead. */
-    &,
+    & {
+      background-image: none !important;
+      background-color: var(--zpt-tint, var(--zen-tab-header-background, var(--zen-main-browser-background))) !important;
+    }
+
+    /* Full-window containers directly over the root — same area, so their own
+       coat was pure duplication of the root's. */
     #browser,
     #appcontent {
       background-image: none !important;
-      background-color: var(--zpt-tint, var(--zen-tab-header-background, var(--zen-main-browser-background))) !important;
+      background-color: transparent !important;
     }
 
     #navigator-toolbox,
@@ -265,6 +302,63 @@
       --toolbar-field-color: light-dark(black, white) !important;
       --input-color: light-dark(black, white) !important;
       color: light-dark(black, white) !important;
+    }
+
+    /* Everything laid out INSIDE the tinted #navigator-toolbox. The toolbox's own
+       coat already backs every one of these, so painting the tint again here is
+       what pushed the sidebar to depth 4–5. They keep the appearance / color /
+       box-shadow resets from the rule above — only the background is dropped.
+       (#zen-media-controls-toolbar keeps its scheme-pinned text below: that pin
+       exists because the card's surface color is unpredictable, which is as true
+       backed by the toolbox tint as it was painting its own.) */
+    #titlebar,
+    #notifications-toolbar,
+    #zen-media-controls-toolbar,
+    #zen-sidebar-top-buttons,
+    #zen-sidebar-foot-buttons {
+      background-color: transparent !important;
+    }
+
+    /* ---------- Directional ambient gradient ----------
+       Gated on zen-page-tint-ambient, which JS sets only when ambient-spread > 0.
+       At spread 0 these rules don't exist, so the default costs nothing — no
+       transparent gradient to composite, no extra layer.
+
+       Painted as background-IMAGE over the existing background-color, which keeps
+       the two jobs separate: the flat base color still fades smoothly through the
+       transition set up below (background-color is the only property in that list),
+       while the directional component rides on top. The edge stops carry the spread
+       strength as alpha, so the compositor does the base↔edge blend.
+
+       Direction follows each surface's shape. The sidebar is a tall column, so it
+       takes the vertical pair; the URL bar strip is wide and short, so it takes the
+       horizontal pair. Using one axis for both would put a gradient across the short
+       dimension of each, where there's no room for it to read as anything.
+
+       Deliberately NOT applied to #main-window or the rim: the rim is an inset
+       box-shadow (solid colors only, and rewriting it as a background would
+       overwrite the workspace gradient it exists to preserve), and stacking a second
+       gradient on the root would reintroduce the per-pixel layering this file
+       already fixed once. */
+    &[zen-page-tint-ambient="on"] {
+      #navigator-toolbox {
+        background-image: linear-gradient(
+          to bottom,
+          var(--zpt-edge-t, transparent),
+          transparent 50%,
+          var(--zpt-edge-b, transparent)
+        ) !important;
+      }
+
+      #sidebar-main,
+      #sidebar-box {
+        background-image: linear-gradient(
+          to bottom,
+          var(--zpt-edge-t, transparent),
+          transparent 50%,
+          var(--zpt-edge-b, transparent)
+        ) !important;
+      }
     }
 
     /* .zen-workspace-tabs-section's box extends a few px past the sidebar's
