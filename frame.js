@@ -202,7 +202,23 @@
       teardownListener: null,
 
       reload() {
-        if (this.instance) { try { this.instance.dispose(); } catch {} }
+        if (this.instance) { try { this.instance.dispose(); } catch {} this.instance = null; }
+
+        // `content` is null when this process has no content window yet — a
+        // remoteness swap in flight, or a browser being torn down. Every path below
+        // dereferences it (start() reads content.document.readyState first thing),
+        // so without this guard reload() throws AFTER disposing the working
+        // instance, leaving a half-built one behind with applyConfig() never
+        // reached. Any other tab sharing this content process then stops updating.
+        // Bail cleanly instead: chrome reloads this script on the next navigation,
+        // which is exactly when a real window exists.
+        if (!content || !content.document) {
+          if (this.config.debug) {
+            try { console.log('[zen-page-tint frame] reload skipped: no content window yet'); } catch {}
+          }
+          return;
+        }
+
         this.instance = createInstance();
         this.instance.start();
         this.instance.applyConfig();

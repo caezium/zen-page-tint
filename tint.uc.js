@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Zen Page Tint
 // @description    Adaptive Zen chrome color from the active page
-// @version        2.0.0
+// @version        2.0.1
 // ==/UserScript==
 
 (() => {
@@ -279,14 +279,77 @@
     return `rgb(${out.r}, ${out.g}, ${out.b})`;
   }
 
+  // ---- Opaque pre-blend (tint strength) ----
+  //
+  // Strength used to be an ALPHA: --zpt-tint was the page color at that opacity,
+  // laid over Zen's chrome so the workspace gradient showed through. That model is
+  // depth-dependent, and Zen's chrome nests four deep, so painting the same
+  // translucent color on an element and its ancestors composites to 1-(1-s)^depth
+  // rather than s. Two consequences, both bad: surfaces at different depths
+  // resolved to visibly different colors (the sidebar vs the frame around the
+  // page), and the slider was badly miscalibrated — at depth 4, strength 50
+  // rendered 94% and anything above ~40 was indistinguishable from 100.
+  //
+  // Now the blend happens here and the painted color is OPAQUE. An opaque color
+  // painted by four nested elements looks identical to one painted once, so depth
+  // stops mattering entirely and strength 50 means 50.
+  //
+  // Tradeoff, deliberately accepted: Zen's workspace gradient no longer shows
+  // through below 100 — you get a blend against its flat base color instead. In
+  // practice the gradient was only 6% visible at strength 50 under the old model,
+  // so little is lost.
+
+  // Zen's chrome base, resolved to rgb. getPropertyValue() hands back custom
+  // properties as unresolved token streams (light-dark(...), color-mix(...)), so
+  // read it through a throwaway element whose `color` computes to a real value.
+  // Cached because this forces a style flush; invalidated on color-scheme change.
+  let chromeBaseCache = null;
+  function chromeBaseColor() {
+    if (chromeBaseCache) return chromeBaseCache;
+    try {
+      const probe = document.createElement('div');
+      probe.style.cssText = 'position:fixed;width:0;height:0;opacity:0;pointer-events:none;'
+        + 'color:var(--zen-main-browser-background)';
+      root.appendChild(probe);
+      const resolved = getComputedStyle(probe).color;
+      probe.remove();
+      if (parseRgb(resolved)) chromeBaseCache = resolved;
+    } catch (e) { log('chrome base probe failed', e); }
+    return chromeBaseCache;
+  }
+
+  // Blend a sampled color toward Zen's chrome base. amount 100 = pure page color,
+  // 0 = pure Zen (though JS drops the tint entirely at 0 before reaching here).
+  // Returns the input unchanged if the base can't be resolved, so a Zen theme that
+  // defines the base in some form we can't read degrades to the old full-strength
+  // look rather than to no tint at all.
+  function blendToChromeBase(color, amount) {
+    if (amount >= 100) return color;
+    const page = parseRgb(color);
+    const base = parseRgb(chromeBaseColor() || '');
+    if (!page || !base) return color;
+    const t = amount / 100;
+    const mix = (a, b) => Math.round(b + (a - b) * t);
+    return `rgb(${mix(page.r, base.r)}, ${mix(page.g, base.g)}, ${mix(page.b, base.b)})`;
+  }
+
   // Turn a transformed edge color into the translucent overlay stop CSS consumes.
   // Alpha carries the spread strength, so the compositor does the base↔edge blend
   // and JS never has to lerp — and at spread 0 the attribute gate below removes the
   // gradient rules entirely rather than painting a no-op.
+  //
+  // Scaled by MIX_AMOUNT as well, because the edges are a deviation FROM the base
+  // surface and that surface composites to MIX_AMOUNT. Pinning edge alpha to spread
+  // alone holds them at full opacity while the base fades: measured at strength 50 /
+  // spread 100, the stops painted at 0.7 over a base whose per-layer alpha was 0.159,
+  // so the ends of the sidebar read as separate blocks of color against a nearly
+  // untinted middle. Scaling keeps the pair proportional, which also makes spread and
+  // strength independent knobs — spread sets how much directional variation you see
+  // relative to the tint, not in absolute terms.
   function edgeStop(color) {
     const rgb = parseRgb(color);
     if (!rgb) return null;
-    const alpha = (AMBIENT_SPREAD / 100) * EDGE_ALPHA_MAX;
+    const alpha = (AMBIENT_SPREAD / 100) * EDGE_ALPHA_MAX * (MIX_AMOUNT / 100);
     return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${alpha.toFixed(3)})`;
   }
 
@@ -294,8 +357,29 @@
   // stylesheet defaults. Idempotent — safe to call on every pref change.
   //   --zpt-strength is the tint OVERLAY opacity (consumed by style.css's
   //   --zpt-tint / the rim box-shadow): 100% = opaque page tint, 0% = none.
+  // How many times the tint gets painted over any given pixel. Zen's chrome nests
+  // #main-window > #browser > (#appcontent | #navigator-toolbox > #titlebar), and
+  // the surround picks up a 4th coat from the ring box-shadow, so every surface
+  // lands on 4. Boxes that would have been a 5th (the sidebar button boxes, the
+  // media card) are held transparent in style.css specifically to keep this uniform.
+  //
+  // It has to be uniform for the compensation below to work. If a future Zen
+  // release re-nests the chrome, the symptom is surfaces disagreeing again below
+  // full strength — the layer dump under `debug` is what to check.
+  const TINT_DEPTH = 4;
+
+  // Per-layer alpha that composites to MIX_AMOUNT across TINT_DEPTH layers.
+  // Stacking alpha is 1-(1-a)^n, so inverting gives a = 1-(1-s)^(1/n). Without
+  // this the slider was wildly non-linear: 50 rendered as 94%, and everything past
+  // ~40 was indistinguishable from fully opaque.
+  function compensatedStrength(amount) {
+    const s = Math.max(0, Math.min(1, amount / 100));
+    if (s >= 1) return 100;
+    return (1 - Math.pow(1 - s, 1 / TINT_DEPTH)) * 100;
+  }
+
   function applyCssVarPrefs() {
-    root.style.setProperty('--zpt-strength', `${MIX_AMOUNT}%`);
+    root.style.setProperty('--zpt-strength', `${compensatedStrength(MIX_AMOUNT).toFixed(2)}%`);
     root.style.setProperty('--zpt-frame-gap', `${Math.max(0, prefInt('zen.page-tint.frame-gap', 5))}px`);
     root.style.setProperty('--zpt-frame-radius', `${Math.max(0, prefInt('zen.page-tint.frame-radius', 14))}px`);
   }
@@ -314,8 +398,14 @@
 
   function renderTint(rawBg, rawEdges) {
     if (rawBg && MIX_AMOUNT > 0) {
+      // The painted value stays the full page color; CSS applies strength as alpha
+      // (--zpt-strength, already depth-compensated). The FOREGROUND pick, though,
+      // has to run against an approximation of what actually lands on screen —
+      // below full strength that's the page color composited over Zen's base, so
+      // picking contrast against the raw page color could put black text on chrome
+      // that has already gone dark.
       const tint = transformColor(rawBg);
-      const fg = readableFg(tint) || 'inherit';
+      const fg = readableFg(blendToChromeBase(tint, MIX_AMOUNT)) || 'inherit';
       root.style.setProperty('--zen-tab-header-background', tint);
       root.style.setProperty('--zen-tab-header-foreground', fg);
       root.setAttribute('zen-page-tint', 'on');
@@ -329,6 +419,10 @@
         let ok = true;
         const stops = {};
         for (const key of Object.keys(EDGE_VARS)) {
+          // Edge alpha carries spread AND strength (see edgeStop): the stop overlays
+          // a surface that itself composites to MIX_AMOUNT, so holding the deviation
+          // at full opacity while the surface fades is what made the sidebar ends
+          // read as blocks of unrelated color at low strength.
           const stop = rawEdges[key] ? edgeStop(transformColor(rawEdges[key])) : null;
           if (!stop) { ok = false; break; }
           stops[key] = stop;
@@ -348,6 +442,44 @@
       root.removeAttribute('zen-page-tint');
       clearEdgeVars();
     }
+  }
+
+  // One-shot diagnostic: report what each chrome layer actually paints once a tint
+  // is live. The rim and the sidebar can resolve to different opacities depending
+  // on how many ancestors happen to paint the translucent tint over a given pixel,
+  // and that stack can't be derived reliably from Zen's stylesheets — some of it is
+  // native macOS material (#zen-browser-background uses -moz-default-appearance),
+  // which doesn't composite like a CSS background. So read the computed values
+  // instead of inferring them. DEBUG-gated and fires once per window.
+  let dumpedChromeLayers = false;
+  function dumpChromeLayers() {
+    if (!DEBUG || dumpedChromeLayers) return;
+    dumpedChromeLayers = true;
+    try {
+      const rs = getComputedStyle(root);
+      const lines = ['[zen-page-tint] chrome layer dump'];
+      for (const v of ['--zpt-tint', '--zpt-strength', '--zen-tab-header-background']) {
+        lines.push(`  ${v} = ${rs.getPropertyValue(v).trim() || '(unset)'}`);
+      }
+      const trim = (s, n) => (s && s !== 'none' ? String(s).slice(0, n) : s);
+      const report = (label, el, pseudo) => {
+        if (!el) { lines.push(`  ${label} -> NOT FOUND`); return; }
+        const s = getComputedStyle(el, pseudo || null);
+        lines.push(`  ${label}`);
+        lines.push(`      bg=${s.backgroundColor} | img=${trim(s.backgroundImage, 46)}`);
+        lines.push(`      shadow=${trim(s.boxShadow, 80)} | appearance=${s.appearance}`);
+      };
+      report('#main-window', root);
+      for (const sel of ['#zen-main-app-wrapper', '#browser', '#appcontent', '#zen-appcontent-wrapper',
+        '#navigator-toolbox', '#zen-browser-background', '#sidebar-main',
+        '.browserSidebarContainer.deck-selected']) {
+        report(sel, document.querySelector(sel));
+      }
+      const bgEl = document.querySelector('#zen-browser-background');
+      report('#zen-browser-background::before', bgEl, '::before');
+      report('#zen-browser-background::after', bgEl, '::after');
+      console.log(lines.join('\n'));
+    } catch (e) { log('chrome layer dump failed', e); }
   }
 
   // Track the last applied (raw) theme so switching between same-colored tabs (the
@@ -370,6 +502,7 @@
     lastAppliedSig = sig;
     lastAppliedTheme = next;
     renderTint(next && next.bg, next && next.edges);
+    if (next) dumpChromeLayers();
   }
 
   // Re-render from the last raw theme without the same-color dedupe. Used when an
@@ -650,7 +783,14 @@
   let onColorSchemeChange = null;
   try {
     colorSchemeQuery = window.matchMedia('(prefers-color-scheme: dark)');
-    onColorSchemeChange = () => { themeCache.clear(); log('color-scheme changed, cache cleared'); scheduleSample(true); };
+    onColorSchemeChange = () => {
+      themeCache.clear();
+      // Zen's chrome base is light-dark(), so it flips with the scheme — the cached
+      // probe result is stale the moment this fires.
+      chromeBaseCache = null;
+      log('color-scheme changed, cache cleared');
+      scheduleSample(true);
+    };
     colorSchemeQuery.addEventListener('change', onColorSchemeChange);
   } catch {}
 

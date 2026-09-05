@@ -192,14 +192,22 @@
 
 @layer zen-page-tint {
   :root[zen-page-tint="on"] {
-    /* The page tint as a translucent OVERLAY color: the sampled page color at
-       --zpt-strength opacity (driven by the mix-amount pref). Surfaces paint THIS
-       instead of the opaque page color, so below 100% strength Zen's own chrome —
-       including the per-workspace gradient — shows through. At 100% it's fully
-       opaque = the original behavior; at 0% JS drops zen-page-tint entirely so
-       none of this applies. This is why mix is an opacity overlay, not a color
-       blend: a workspace gradient is a gradient, not a single color, so it can't
-       be reproduced by mixing one color. */
+    /* The page tint as a translucent OVERLAY, so Zen's own chrome — including the
+       per-workspace gradient — genuinely shows through below full strength.
+
+       --zpt-strength is NOT the user's strength value. It's the per-layer alpha that
+       composites to that value across the 4 layers Zen's nesting produces (see
+       TINT_DEPTH / compensatedStrength in tint.uc.js). Stacking alpha is
+       1-(1-a)^n, so painting the raw strength on every layer overshoots badly —
+       that's what made 50 render as 94% and flattened everything above ~40 into
+       looking fully opaque.
+
+       An opaque pre-blend was tried instead and reverted: it's depth-proof, but it
+       can only blend toward a single flat base color, and Zen's chrome isn't a flat
+       color when a workspace gradient is set. At low strengths it looked nothing
+       like the user's actual theme, which is the whole point of lowering it.
+
+       At 0% JS drops zen-page-tint entirely so none of this applies. */
     --zpt-tint: color-mix(in srgb,
       var(--zen-tab-header-background, var(--zen-main-browser-background)) var(--zpt-strength, 100%),
       transparent);
@@ -226,27 +234,38 @@
        different. That's the "colors aren't uniform below 100%" bug (#14): not a
        wrong color anywhere, just the same color applied a different number of
        times per region.
-       Fix: exactly one element paints the tint over any given pixel. Elements
-       that merely CONTAIN a tinted surface are set transparent below — they still
-       override Zen's own background (so its opaque chrome color is suppressed
-       just as before), they just stop adding another coat.
+       Fix: drop the redundant coats from elements that merely CONTAIN a tinted
+       surface AND are fully covered by it — currently the boxes inside
+       #navigator-toolbox. They still override Zen's own background (so its opaque
+       chrome color is suppressed just as before), they just stop adding a layer.
        At 100% strength --zpt-tint is fully opaque, where stacking is a no-op, so
-       the default look is byte-identical to before. */
+       the default look is unchanged either way.
+
+       NOT every container qualifies. #browser / #appcontent were included in
+       v2.0.0 and had to be reverted — see the note on them below. The test isn't
+       "does this element contain a tinted surface", it's "is every pixel this
+       element paints also painted by something tinted on top of it". */
 
     /* `&` is the root element (= #main-window). A nested `#main-window` selector
        desugars to ":root[zen-page-tint=on] #main-window" — #main-window as a
-       descendant of itself — which never matches, so it was previously dead. */
-    & {
-      background-image: none !important;
-      background-color: var(--zpt-tint, var(--zen-tab-header-background, var(--zen-main-browser-background))) !important;
-    }
+       descendant of itself — which never matches, so it was previously dead.
 
-    /* Full-window containers directly over the root — same area, so their own
-       coat was pure duplication of the root's. */
+       #browser and #appcontent MUST keep painting. v2.0.0 set them transparent as
+       part of the de-stacking above, reasoning that they duplicate the root's coat
+       over the same area. They don't: #appcontent's background is what backs the
+       frame-gap surround and the strip between the content and the sidebar (the
+       tint-ring box-shadow on .browserSidebarContainer only reaches --zpt-frame-gap
+       past the content, and #zen-browser-background sits between these layers with
+       a NATIVE macOS material — `-moz-default-appearance: -moz-sidebar` in Zen's
+       zen-browser-ui.css — not a CSS color, so it does not composite the way a
+       plain background does). Dropping them left the surround a visibly different
+       color from the sidebar at every strength, live mode, and spread setting, and
+       also changed what backs the .zen-workspace-tabs-section overhang. */
+    &,
     #browser,
     #appcontent {
       background-image: none !important;
-      background-color: transparent !important;
+      background-color: var(--zpt-tint, var(--zen-tab-header-background, var(--zen-main-browser-background))) !important;
     }
 
     #navigator-toolbox,
@@ -279,12 +298,32 @@
       box-shadow: none !important;
     }
 
-    /* Compact mode puts an opaque, scheme-colored backdrop over the tinted
-       toolbox/topbar. Make that visual layer transparent so the already-tinted
-       parent surface remains visible; retain Zen's own radius, outline and
-       floating shadow. Acrylic's brightness filter would darken the tint too. */
+    /* ---------- Compact mode: tint the panel, not the container ----------
+       Compact mode splits the floating sidebar across two elements with different
+       jobs (Zen's zen-compact-mode.css):
+         #navigator-toolbox      position: fixed, has left padding, NO radius, NO clip
+         .zen-toolbar-background z-index: -1, overflow: clip, border-radius, box-shadow
+       The second one is the thing you actually see as a rounded floating panel; the
+       first is just an unshaped positioning container.
+
+       Painting the tint on the container and blanking the panel — which is what this
+       did — puts the color on the unshaped box: square corners, spilling into the
+       padding, unclipped. That's the compact-mode background overflow.
+
+       So paint the panel and let the container go transparent. The tint is then
+       confined to Zen's own geometry by construction rather than by us trying to
+       reproduce its radius and clip.
+
+       Applied as a background-IMAGE so Zen's own backdrop color underneath survives:
+       at 100% strength --zpt-tint is opaque and covers it, below that Zen's compact
+       backdrop shows through, which is the same show-through model the rest of the
+       file uses. backdrop-filter is dropped because acrylic's brightness pass would
+       darken the tint. Radius, outline and floating shadow are left untouched. */
+    &[zen-compact-mode="true"] #navigator-toolbox {
+      background-color: transparent !important;
+    }
     &[zen-compact-mode="true"] .zen-toolbar-background {
-      background: transparent !important;
+      background-image: linear-gradient(var(--zpt-tint, transparent), var(--zpt-tint, transparent)) !important;
       backdrop-filter: none !important;
     }
     &[zen-compact-mode="true"] .zen-toolbar-background::before,
@@ -304,15 +343,25 @@
       color: light-dark(black, white) !important;
     }
 
-    /* Everything laid out INSIDE the tinted #navigator-toolbox. The toolbox's own
-       coat already backs every one of these, so painting the tint again here is
-       what pushed the sidebar to depth 4–5. They keep the appearance / color /
-       box-shadow resets from the rule above — only the background is dropped.
+    /* Only the FIFTH layer comes off, not the fourth.
+       Confirmed depths, counting coats of --zpt-tint over a pixel:
+         surround / frame gap  #main-window + #browser + #appcontent + the ring
+                               box-shadow on .browserSidebarContainer      = 4
+         sidebar               #main-window + #browser + #navigator-toolbox
+                               + #titlebar                                 = 4
+         foot buttons / media  all of the sidebar's, plus their own         = 5
+       So the sidebar and the surround already agreed at 4, and #14 was only ever
+       about the boxes at 5 reading stronger than the sidebar around them.
+
+       v2.0.0 also dropped #titlebar and #notifications-toolbar, which sit at 4
+       alongside the sidebar rather than inside it. That took the whole sidebar to 3
+       and broke its match with the surround — the tint still changed, it just
+       resolved a shade weaker than the frame around the page. Those two paint
+       again; only the boxes nested inside #titlebar stay transparent, backed by its
+       coat.
        (#zen-media-controls-toolbar keeps its scheme-pinned text below: that pin
        exists because the card's surface color is unpredictable, which is as true
-       backed by the toolbox tint as it was painting its own.) */
-    #titlebar,
-    #notifications-toolbar,
+       backed by the titlebar tint as it was painting its own.) */
     #zen-media-controls-toolbar,
     #zen-sidebar-top-buttons,
     #zen-sidebar-foot-buttons {
@@ -340,25 +389,37 @@
        overwrite the workspace gradient it exists to preserve), and stacking a second
        gradient on the root would reintroduce the per-pixel layering this file
        already fixed once. */
-    &[zen-page-tint-ambient="on"] {
-      #navigator-toolbox {
-        background-image: linear-gradient(
-          to bottom,
-          var(--zpt-edge-t, transparent),
-          transparent 50%,
-          var(--zpt-edge-b, transparent)
-        ) !important;
-      }
+    /* #navigator-toolbox is excluded in compact mode for the same reason the flat
+       tint is: there it's an unshaped position:fixed container, so a gradient on it
+       spills past the rounded panel exactly like the background did. */
+    /* #appcontent carries it too, so the gradient doesn't stop dead at the sidebar
+       edge. It's the one surround element that paints a real background — the frame
+       gap ring and the outer rim are box-shadows, which take a solid color only —
+       so it's the only place the surround can pick the gradient up. */
+    &[zen-page-tint-ambient="on"]:not([zen-compact-mode="true"]) #navigator-toolbox,
+    &[zen-page-tint-ambient="on"] #appcontent,
+    &[zen-page-tint-ambient="on"] #sidebar-main,
+    &[zen-page-tint-ambient="on"] #sidebar-box {
+      background-image: linear-gradient(
+        to bottom,
+        var(--zpt-edge-t, transparent),
+        transparent 50%,
+        var(--zpt-edge-b, transparent)
+      ) !important;
+    }
 
-      #sidebar-main,
-      #sidebar-box {
-        background-image: linear-gradient(
+    /* Compact mode: the shaped panel carries both layers. Comma-separated
+       background-image layers paint first-on-top, so the directional gradient sits
+       over the flat tint, matching the non-compact stacking. */
+    &[zen-page-tint-ambient="on"][zen-compact-mode="true"] .zen-toolbar-background {
+      background-image:
+        linear-gradient(
           to bottom,
           var(--zpt-edge-t, transparent),
           transparent 50%,
           var(--zpt-edge-b, transparent)
-        ) !important;
-      }
+        ),
+        linear-gradient(var(--zpt-tint, transparent), var(--zpt-tint, transparent)) !important;
     }
 
     /* .zen-workspace-tabs-section's box extends a few px past the sidebar's
@@ -435,6 +496,17 @@
        belongs and the ring still paints. */
     &:not([zen-compact-mode="true"]) .browserSidebarContainer:not(.zen-glance-background):not(.zen-glance-overlay) {
       box-shadow: 0 0 0 var(--zpt-frame-gap) var(--zpt-tint, var(--zen-tab-header-background, var(--zen-main-browser-background))) !important;
+    }
+
+    /* With the directional gradient on, this ring is the one thing in the surround
+       that CAN'T carry it — a box-shadow takes a solid color only — so it renders as
+       a flat band sandwiched between the gradient on #appcontent and the gradient on
+       the sidebar. #appcontent's box already extends through the frame gap (the gap
+       is #zen-appcontent-wrapper's margin, and #appcontent is its ancestor), so
+       dropping the ring here lets that gradient fill the band instead of being
+       painted over by it. */
+    &[zen-page-tint-ambient="on"]:not([zen-compact-mode="true"]) .browserSidebarContainer:not(.zen-glance-background):not(.zen-glance-overlay) {
+      box-shadow: none !important;
     }
 
     #zen-sidebar-splitter,
@@ -592,6 +664,16 @@
     &[zen-compact-mode="true"] #navigator-toolbox:not([animate="true"]) #titlebar {
       transition: visibility 0.15s,
                   background-color var(--zpt-live-smoothing-ms, 1000ms) ease-out !important;
+    }
+
+    /* In compact mode the tint lives on .zen-toolbar-background as a gradient layer
+       (the container is transparent there — see the compact note above), so fade
+       THAT instead of a background-color that no longer changes. Same-structure
+       gradients interpolate fine, and this element sits at z-index -1 with the tab
+       strip in a sibling, so it isn't the surface the paint-cost warning above is
+       about. Without this, compact-mode color changes snap. */
+    &[zen-compact-mode="true"] .zen-toolbar-background {
+      transition: background-image var(--zpt-live-smoothing-ms, 1000ms) ease-out !important;
     }
 
     /* Belt-and-suspenders: explicitly suppress any transition on tab elements
