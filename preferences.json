@@ -105,7 +105,7 @@
   {
     "type": "checkbox",
     "property": "zen.page-tint.youtube-ambient",
-    "label": "On YouTube, sample the player's own ambient mode (\"cinematic lighting\") canvas. Matches the glow YouTube draws on screen and skips letterbox bars. Needs Ambient mode enabled in the player; falls back automatically when it isn't.",
+    "label": "On YouTube, follow video colors while the player's Ambient mode is enabled. Excludes padding around the video; falls back to normal page sampling when Ambient mode is off.",
     "defaultValue": true
   },
   {

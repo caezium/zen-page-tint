@@ -2,7 +2,7 @@
 
 Adaptive chrome color for [Zen Browser](https://zen-browser.app/) — the URL bar, sidebar, titlebar, and outer rim tint to match the active page's background.
 
-**Built for heavy-tab sessions.** Tested at 1,200+ open tabs without measurable tab-switch lag.
+**Designed for large tab sessions.** Reuses sampled colors, avoids per-tab tint animations, and leaves unloaded tabs asleep.
 
 **Fully tunable** from a Sine settings panel — tint strength (overlay over your own Zen theme/gradient), saturation, lightness clamp, and per-site rules. See [Configuration](#configuration).
 
@@ -27,12 +27,14 @@ Other adaptive-color mods exist, but they tend to feel laggy at high tab counts 
 
 `zen-page-tint` is built around the opposite constraints:
 - **One sample per tab switch** — `TabSelect` + `onLocationChange` pairs coalesce into a single deferred run
-- **Per-origin LRU cache** (3000 entries) — revisits are instant, zero IPC
+- **Per-URL LRU cache** (3000 entries) — settled-tab revisits are instant, zero IPC; query strings and hash routes stay separate
 - **Deferred via `requestAnimationFrame` + setTimeout race** — tab clicks register before the JS runs, and the safety-net `setTimeout` means we don't get stuck when `rAF` is throttled
 - **No transitions on per-tab elements** — color snaps; sidebar/toolbar still animate smoothly
 - **Skips `about:` / `chrome:`** — keeps Zen's defaults where they belong
 
 ## Install
+
+This mod requires [Sine](https://github.com/CosmoCreeper/Sine). Check that Sine appears in Zen Settings before installing the mod.
 
 **From the Sine store** (recommended): in Zen, open **Sine → Marketplace**, search **Zen Page Tint**, and install. Enable it and restart Zen — updates then land automatically.
 
@@ -57,7 +59,7 @@ Everything is configurable from the **Sine settings panel** for this mod (Zen �
 | `zen.page-tint.max-lightness` | `100` | Lightness **cap** (0–100): keeps blinding-white pages from washing the chrome out. `100` = no cap. |
 | `zen.page-tint.disable-hosts` | `''` | Comma-separated host list (same syntax as `live-mode-hosts`, supports `*.example.com`) where the tint is turned **off** — the chrome keeps your Zen theme on those sites. |
 | `zen.page-tint.youtube-ambient` | `true` | On YouTube, sample the **video's own picture box** rather than a centered viewport grab, gated on the player's Ambient mode being on — see [YouTube ambient mode](#youtube-ambient-mode). Falls back to normal sampling when Ambient mode is off. |
-| `zen.page-tint.light-average` | `false` | Average **page** samples as light instead of as flat color (decode sRGB to linear, weight vivid cells above gray ones). Physically more accurate and noticeably brighter/more saturated on mixed pages — a mostly-dark page with bright content on it stops reading as dark, which is why it's off by default. The YouTube ambient source always uses this model regardless. |
+| `zen.page-tint.light-average` | `false` | Average **page** samples in linear light, with extra weight for vivid pixels. This often produces brighter, more saturated results; the chroma weighting is an aesthetic choice. A mostly-dark page with bright content can stop reading as dark, which is why it's off by default. The YouTube source always uses this model. |
 | `zen.page-tint.frame-gap` | `5` | Gap (px) between the content area and the window edge in non-compact mode. Compact mode stays flush so Zen's screen-edge hover controls remain reachable. Extremely large values can push the page viewport entirely offscreen. |
 | `zen.page-tint.frame-radius` | `14` | Content corner radius (px). |
 
@@ -67,7 +69,7 @@ Everything is configurable from the **Sine settings panel** for this mod (Zen �
 |---|---|---|
 | `zen.page-tint.live-mode` | `true` | Master switch for live mode — continuous polling so the chrome tint follows video / animated content. When off, the tint is purely event-driven. |
 | `zen.page-tint.live-mode-rate-ms` | `2000` | The poll interval (0.5 Hz), used **verbatim** — this is how often the chrome color can change. Floored at 100 ms as a guard against an absurd value. Keep it at or above `live-mode-smoothing-ms`, or each fade is interrupted by the next sample and the chrome never settles on a color. |
-| `zen.page-tint.live-mode-threshold` | `8` | Minimum per-channel color change (0–255) needed to actually re-tint during live polling. Imperceptible frame-to-frame jitter below this is ignored so the chrome doesn't churn on near-static scenes. `0` = re-tint on any change. This is the sensitivity knob; `live-mode-rate-ms` is the cadence knob, and they're independent. |
+| `zen.page-tint.live-mode-threshold` | `8` | Minimum per-channel color change (0–255) needed to actually re-tint during live polling. With ambient spread enabled, directional colors are checked too. Imperceptible frame-to-frame jitter below this is ignored so the chrome doesn't churn on near-static scenes. `0` = re-tint on any change. This is the sensitivity knob; `live-mode-rate-ms` is the cadence knob, and they're independent. |
 | `zen.page-tint.live-mode-smoothing-ms` | `1000` | Duration of the CSS fade applied to **every** tint change (live ticks, event-driven samples, and tab-switch cache hits). |
 | `zen.page-tint.live-mode-always-on` | `false` | When `false`, live polling only runs while a `<video>` on the page is actually playing — static pages cost nothing. Set `true` to poll every foregrounded page regardless. |
 | `zen.page-tint.live-mode-hosts` | `''` | Comma-separated host allowlist; matching sites are treated as always-on. The supported workaround for players auto-detect can't see — canvas/WebGL players and cross-origin `<iframe>` embeds. Matched by hostname, so port-independent (`localhost` matches `localhost:3000`). Supports `*.example.com`. Example: `example.com, *.spotify.com, localhost`. |
@@ -79,18 +81,18 @@ The `--zpt-frame-shadow` drop shadow is still a CSS knob in `style.css` `:root` 
 
 By default the chrome takes one flat color from the page. With `zen.page-tint.ambient-spread` above `0`, it instead takes color from the *matching side*: the left of the URL bar strip from the left of the page, the top of the sidebar from the top, and so on — so a video with a warm left edge and a cool right edge lights the chrome the same way round.
 
-The data was always there. `frame.js` reduces the sampled region to a 16×16 grid and the old code averaged all 256 cells into a single color, discarding the spatial layout. Now it also accumulates four directional bands (6 columns/rows in from each edge, leaving the middle to neither so the two sides stay distinguishable) and sends those alongside the base color. It's one extra accumulate per cell inside a loop that was already running, so the cost is negligible — and at spread `0` the frame script is told not to compute them at all.
+`frame.js` reduces the sampled region to a 16×16 grid. With spread enabled it also averages four directional bands (6 columns/rows in from each edge, leaving the middle to neither so the two sides stay distinguishable). This reuses the same pixel capture; at spread `0` the band calculations are skipped.
 
-Rendering is a `background-image` gradient laid over the existing `background-color`, with the edge colors carrying the spread strength as alpha so the compositor does the base-to-edge blend. That split matters: the flat base still fades smoothly through the existing colour transition, and the directional layer rides on top without being animated. Edge colors go through the same saturation / brightness / contrast / clamp transform as the base, so tuning any of those moves the whole gradient together instead of letting it drift out of family.
+The flat color and directional gradients compose inside one overlay. Tint strength controls the opacity of that complete result, so strength `50` preserves 50% of the native background even at full spread. Applying 50% independently to a flat tint and a gradient would compound their opacity. The flat color and overall opacity fade smoothly; directional stops update at each accepted sample. All colors use the same saturation, brightness, contrast and lightness adjustments.
 
 Two deliberate limits:
 
-- **Alpha is capped below full.** The readable-foreground pick is computed against the base color, so letting an edge fully replace the base at the extremes would break text contrast. Capping keeps the endpoints tethered.
-- **It's on the sidebar and the URL bar strip only** — not the window rim or root. The rim is an inset `box-shadow`, which takes solid colors only, and rewriting it as a background would paint over the workspace gradient it exists to preserve. Stacking a gradient on the root would also reintroduce the layering problem described in the tint-strength notes.
+- **Spread is limited by text contrast.** Edge opacity is reduced when the resulting gradient would make the chosen foreground unreadable, including intermediate colors between its endpoints. Below full strength, contrast uses an approximation of the native background; arbitrary workspace gradients and native materials can still need manual tuning.
+- **The sidebar and surround share a vertical gradient; the URL strip gets a horizontal one.** Both are inside the same window overlay, with a cutout separating their regions. Compact panels carry their gradient inside Zen's own rounded clip. The vertical field stays aligned when the sidebar moves to the right.
 
 Only the two grid-based sample paths can produce a gradient. A page whose color comes from `<meta name="theme-color">` or a computed style yields one value with no spatial content, so it tints flat — which is correct, since there'd be nothing to infer a direction from.
 
-This is the analogue of the userstyle's `scale(4)` plus 3500px blur, done as chrome geometry rather than a GPU blur pass over page content.
+This is a coarse directional approximation of the userstyle's glow. It has four edge colors and no two-dimensional image diffusion, corner samples, or page-side blur.
 
 ## YouTube ambient mode
 
@@ -98,23 +100,23 @@ YouTube's own "Ambient mode" (cinematic lighting) paints downscaled copies of th
 
 Two things it fixes:
 
-- **Letterbox bars stop dragging the tint dark.** A 21:9 video in a 16:9 player puts black bars exactly where the centered read looks, so they get averaged in. The picture box is derived from the video's own `videoWidth`/`videoHeight` against its layout box, so the bars are excluded geometrically. The outer 4% is trimmed too — edge rows carry compression ringing and the player rounds its corners.
-- **No page furniture in the sample.** Comments, the recommendations column, and the player chrome are all outside the sampled region by construction.
+- **Layout letterbox bars are excluded.** The picture box is derived from the video's intrinsic dimensions and layout box, with a 4% inset. Black bars encoded into the video itself remain part of the picture.
+- **Comments and recommendations are excluded.** Sampling is confined to the video picture. Controls, subtitles, or dialogs painted over that picture can still affect the capture.
 
 This path is always averaged as *light* (linear, chroma-weighted) regardless of `light-average`, because it's modelling light coming off a screen rather than a flat surface color.
 
 Cropping to the video removes the static page furniture that used to damp frame-to-frame variance, so on moving content nearly every poll clears `live-mode-threshold`. That means the chrome changes at your configured `live-mode-rate-ms` — every 2 s by default. Raise the rate for a calmer frame, or raise the threshold if you'd rather it only react to real scene changes.
 
-**Why not read YouTube's canvas directly?** That was the first implementation and it cannot work. YouTube's video is served cross-origin from `googlevideo.com` without CORS, so the moment a frame is drawn the canvas is origin-tainted — YouTube can display it, but `getImageData` throws `SecurityError`. Confirmed in the wild: the canvas reads fine while blank, then dies exactly when playback starts. `drawWindow` is the privileged compositor read the main pixel path already uses, so tainting doesn't apply to it, and scoping it to the video's picture box gets the same colors with better letterbox handling than the canvas offered.
+**Why not read YouTube's canvas directly?** The earlier canvas-copy implementation encountered `SecurityError` once cross-origin video frames arrived. This implementation instead uses the privileged `drawWindow` capture already used for ordinary pages. It samples the source picture and applies its own averaging; it does not reproduce YouTube's exact blur, color processing or cross-fade timing.
 
-**Turning it on:** enable Ambient mode in the YouTube player (gear icon → Ambient mode); it's dark-theme and watch-page only. If you run the [Zen Internet](https://addons.mozilla.org/firefox/addon/zen-internet/) transparency mod, its "no ambient mode" toggle removes the element this gates on, so turn that off. Whenever the gate isn't satisfied the normal sample chain runs exactly as before, so there's no failure mode to manage.
+**Turning it on:** enable Ambient mode in the YouTube player's settings on a watch page. The mod checks that `#cinematics` is rendered and visible, since YouTube can retain a hidden element when Ambient mode is off. Visibility changes also resample a paused video. If another mod hides that element, ordinary page sampling is used instead.
 
-Note this *reads* the video; it doesn't amplify anything. Userstyles that crank `#cinematics` with a multi-thousand-pixel blur to spill the glow across the whole window are a separate, page-side thing — they cost real GPU and need a transparent-chrome setup to reach the browser frame. This gets the chrome to match at no rendering cost, and works whether or not you run any of that.
+The mod colors browser chrome directly and needs no transparency mod or page-side blur. Pixel capture, readback, styling, and compositing still have a cost; the absence of a large blur pass does not mean zero CPU or GPU overhead.
 
 ## Known limitations
 
-- **Boost edits on the currently open page require a refresh.** When you live-edit a [Zen Boost](https://zen-browser.app/) on a page that's already loaded, the chrome tint won't update until you refresh the page (or switch to another tab and back). Boosts apply styling via `CSSStyleSheet.insertRule` and browser-level user-stylesheets, neither of which fires a DOM `MutationObserver`. Background polling would catch it but at a constant CPU cost that didn't feel worth it — open to revisiting if folks ask.
-- **YouTube in fullscreen video** mode drops the `#cinematics` element the ambient path gates on, so it falls back to the centered viewport read — which in fullscreen is the video anyway, just without the letterbox trimming. Outside fullscreen the ambient path handles it.
+- **Some live Boost edits require a refresh.** Styling changes made through `CSSStyleSheet.insertRule` or browser-level user stylesheets don't fire a DOM `MutationObserver`. Reload the page to resample them; switching away and back can reuse the cached color. Always-on foreground polling can also detect these edits when enabled.
+- **YouTube in fullscreen video** uses ordinary viewport sampling whenever its ambient element is absent or hidden, which can include layout letterbox bars.
 - **Live mode doesn't auto-detect video inside cross-origin `<iframe>` embeds** (the common YouTube/Vimeo/Spotify embed on a third-party page). That `<video>` lives in a separate browsing context, so its play/pause events never reach the parent document and auto-detect can't see it. The tint *would* follow it correctly if polling ran — only the trigger is missing. Workaround: add the host to `zen.page-tint.live-mode-hosts` to force always-on polling there. A site's own pages (e.g. youtube.com itself, where the `<video>` is same-origin) work without this.
 - **`drawWindow` is flagged non-standard in MDN** and may be removed in a future Gecko. If that happens, the meta-tag and computed-style fallbacks still work but Gmail-class accuracy is lost. No drop-in replacement exists today.
 
@@ -123,14 +125,14 @@ Note this *reads* the video; it doesn't amplify anything. Userstyles that crank 
 **`tint.uc.js`** runs in the chrome (`browser.xhtml`):
 1. Listens for `TabSelect`, `onLocationChange` (top-level only — iframe loads filtered out), `TabClose`, and OS `prefers-color-scheme` changes.
 2. On fire, coalesces via `requestAnimationFrame` raced against a 100ms `setTimeout` safety net (rAF can be throttled when the window is occluded), then samples the active browser.
-3. Cache hit → applies `--zen-tab-header-background` + `--zen-tab-header-foreground` instantly (no IPC).
+3. A settled tab restores its own last sample immediately, including directional colors. Duplicate URLs keep separate samples, since video frames, scroll positions and app state can differ. Revisiting the same document, URL and settings needs no IPC.
 4. Cache miss → loads `frame.js` into the content process. Frame script samples + observes mutations, and pushes updates via `sendAsyncMessage`.
-5. Cache is bounded LRU (3000 entries) keyed by `origin + pathname`. Cleared on OS color-scheme change so prefers-color-scheme-aware sites re-sample fresh.
-6. Sampled color is adjusted (saturation / lightness clamp) and the foreground (black or white) is picked against the result via Rec 601 luminance for max contrast.
+5. Tabs without a current sample can show a provisional tint from a bounded LRU cache (3000 entries) keyed by the full URL, including query strings and fragments, while their own sampler starts. Color-source and OS color-scheme changes invalidate cached samples. Request IDs and configuration revisions reject stale replies, including replies queued before a mod hot reload.
+6. Sampled colors are adjusted for saturation, brightness, contrast and lightness bounds. Black or white foreground is chosen using linear-sRGB relative luminance and contrast ratios.
 7. A transient Zen Glance keeps its parent tab's tint while the parent remains visible behind it. Expanding the Glance into a normal tab hands tint ownership to the child and samples it normally.
 
 **`frame.js`** runs in the content process. Sample chain (first match wins):
-0. **YouTube's video picture box** (host-gated to `*.youtube.com`, gated on `#cinematics` existing, only when `youtube-ambient` is on) — a `drawWindow` read of just the painted video, letterbox bars excluded geometrically. See [YouTube ambient mode](#youtube-ambient-mode) for why this reads the compositor rather than YouTube's canvas. Falls through to step 1 whenever the gate isn't satisfied or the player is scrolled out of view.
+0. **YouTube's video picture box** (host-gated to `*.youtube.com`, gated on `#cinematics` being visible, only when `youtube-ambient` is on) — a `drawWindow` read of the painted video region, excluding layout letterbox bars. Falls through to step 1 when the gate isn't satisfied or the player is scrolled out of view.
 1. **`drawWindow` pixel of the central 60% of the viewport, downsampled to a 16×16 grid and averaged** — ground truth of what's actually painted, weighted to the dominant central tone rather than whatever single element lands dead-center. Picks up Zen Boost overlays, dark-mode toggles, Gmail-class apps where `<body>` lies about the visible color.
 2. `<meta name="theme-color">` — fallback for the rare case where pixel can't read (pre-paint, fully transparent page). Note this is often the *address-bar* color a site declares for mobile, **not** its page bg — e.g. GitHub's meta is `rgb(30,35,39)` but its actual page bg is `rgb(13,17,23)` — so we prefer pixel even when meta is present. Media-aware (light/dark variants honored) and normalized to canonical `rgb()` via the canvas color parser, so hex/HSL/named all work.
 3. `body.backgroundColor`.
@@ -139,20 +141,16 @@ Note this *reads* the video; it doesn't amplify anything. Userstyles that crank 
 
 Observers in content:
 - **`<html>` / `<body>` attribute mutations** — filtered to ~11 theme-relevant attributes (`class`, `style`, `data-theme`, `data-bs-theme`, `data-color-mode`, etc.) so noisy pages don't keep waking the sampler.
-- **`<head>` mutations** — `childList` + `subtree characterData` + filtered attributes on `link`/`meta`/`style`. Catches stylesheet swaps and dynamic theme-color changes.
-- **`load` + `pageshow`** — re-sample at +300ms and +2000ms with 500ms dedupe (catches slow apps that bootstrap their theme after `load` — Gmail).
+- **`<head>` mutations and stylesheet loads** — filtered mutations catch stylesheet swaps and dynamic theme-color changes; a stylesheet-specific load handler catches downloads that finish after the mutation debounce. Title churn is ignored even while hidden.
+- **`load` + `pageshow`** — re-sample at +300ms and +2000ms with 500ms dedupe (catches slow apps that bootstrap their theme after `load` — Gmail). Every sample checks visibility; hidden work waits until the tab is shown. Disposal cancels timers, observers and listeners.
 
-**`style.css`** lays the page color as a translucent **overlay** (`--zpt-tint`, opacity set by the strength pref) across the URL bar, sidebar, titlebar, splitter, tab labels, and the outer window-background rim. Below full strength, Zen's own theme / workspace gradient shows through; the rim uses an inset box-shadow so the gradient survives underneath instead of being painted over.
+**`style.css`** paints one overlay inside the window backdrop and each native compact-panel backdrop. The base and gradients compose inside it before tint strength applies, so 50% remains 50% with ambient spread enabled. Containers above them stay transparent. Zen retains its workspace gradients, materials, panel clipping and reveal animations. Only these leaf overlays animate their color and opacity; tab labels change immediately. Cleanup removes the overlays and restores the original inline CSS values.
 
 ## Performance
 
-Measured under a 1,200+ tab session:
+Settled tab revisits reuse samples without content-process messages. Static pages do not continuously poll by default, and background tabs suspend polling. Appearance changes avoid enumerating unloaded browsers; a regression test checks this with 1,700 simulated unloaded tabs.
 
-| Path | CPU |
-|---|---|
-| Cache hit (revisit) | ~0.5 ms |
-| Cache miss (first visit) | ~10–15 ms |
-| Idle | ~0 |
+Pixel capture, canvas readback, styling and compositing still cost work. The tests verify these scheduling and caching behaviors, not a current CPU/GPU percentage or a benchmark of a real large-tab session.
 
 ## Compatibility
 
@@ -162,6 +160,24 @@ Measured under a 1,200+ tab session:
 ## License
 
 [MIT](LICENSE).
+
+## Testing
+
+Run the regression tests with Node.js 18 or later:
+
+```sh
+node --test tests/*.test.cjs
+```
+
+For renderer and message-bridge checks against an installed Zen, run:
+
+```sh
+python3 tests/zen-smoke.py
+# Or pass a different Zen executable:
+python3 tests/zen-smoke.py /path/to/zen
+```
+
+The smoke test launches a disposable headless profile and leaves your normal profile alone. It loads the actual scripts through a temporary resource package and substitutes Sine's frame-script transport with the same source bytes. It checks sampling, cache reuse, rendered opacity at strength 1/50/100 and spread 0/100, both sidebar sides and toolbar layouts, compact mode, fullscreen and teardown. Screenshots and pixel measurements are saved in the printed temporary directory. Manual checks are still useful for OS materials, real video players, Glance and large tab sessions.
 
 ## Contributing
 

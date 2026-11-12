@@ -5,12 +5,12 @@
 //
 // Lifecycle:
 //   - The persistent singleton (config + teardown message listeners, stored on the
-//     frame-script global `globalThis`) is installed ONCE per content process. It
+//     frame-script global `globalThis`) is installed ONCE per browser frame scope. It
 //     survives loadFrameScript re-execution, which chrome triggers on every
 //     navigation and every cache-miss tab select.
 //   - A per-document "instance" (canvas, observers, event listeners, poll loop) is
 //     rebuilt on each (re)load and torn down cleanly first. Anchoring the install
-//     guard on `globalThis` (process lifetime) instead of `content` (per-document)
+//     guard on `globalThis` (frame lifetime) instead of `content` (per-document)
 //     is what prevents the listener/poller accumulation that the old guard caused —
 //     `content` is a fresh window object after every cross-document navigation.
 //
@@ -182,15 +182,13 @@
     }
 
     // ============================================================
-    // Persistent singleton — process-lifetime, installed once.
+    // Persistent singleton — frame-scope lifetime, installed once.
     // ============================================================
     const singleton = {
-      // Config, updated by the chrome side's config message. Persisted here so a
-      // per-document reload can re-apply it without waiting for a new message.
-      // ytAmbient defaults true (matching the pref default) so the feature still
-      // works if a config message is ever dropped; a delivered message is
-      // authoritative either way.
+      // Config persists across document instances. Each new instance still waits
+      // for chrome's current request before its first sample or poll.
       config: {
+        requestId: null,
         liveRateMs: 0, alwaysOn: false, threshold: 0, debug: false,
         ytAmbient: true, lightAverage: false,
         // Compute per-edge colors? Off unless the chrome side has a non-zero
@@ -204,14 +202,8 @@
       reload() {
         if (this.instance) { try { this.instance.dispose(); } catch {} this.instance = null; }
 
-        // `content` is null when this process has no content window yet — a
-        // remoteness swap in flight, or a browser being torn down. Every path below
-        // dereferences it (start() reads content.document.readyState first thing),
-        // so without this guard reload() throws AFTER disposing the working
-        // instance, leaving a half-built one behind with applyConfig() never
-        // reached. Any other tab sharing this content process then stops updating.
-        // Bail cleanly instead: chrome reloads this script on the next navigation,
-        // which is exactly when a real window exists.
+        // A remoteness swap can temporarily leave this frame without a window.
+        // Chrome retries on navigation; config delivery can also repair it below.
         if (!content || !content.document) {
           if (this.config.debug) {
             try { console.log('[zen-page-tint frame] reload skipped: no content window yet'); } catch {}
@@ -224,8 +216,8 @@
         this.instance.applyConfig();
         // Ask chrome to (re)push config. Cheap, idempotent, and the only thing
         // that makes delivery deterministic on a first load — see
-        // READY_MESSAGE_NAME. Config already stored on the singleton stays in
-        // effect meanwhile, so this is a repair path, not the primary one.
+        // READY_MESSAGE_NAME. The new instance defers sampling until a config
+        // message confirms the current request, even if an older config exists.
         try { sendAsyncMessage(READY_MESSAGE_NAME, {}); } catch (e) {}
         if (this.config.debug) {
           try {
@@ -236,7 +228,9 @@
       },
 
       applyConfig(data) {
+        const previous = this.config;
         this.config = {
+          requestId: data?.requestId ?? null,
           liveRateMs: data && data.liveRateMs > 0 ? data.liveRateMs : 0,
           alwaysOn: !!(data && data.alwaysOn),
           threshold: data && data.threshold > 0 ? data.threshold : 0,
@@ -245,7 +239,8 @@
           lightAverage: !!(data && data.lightAverage),
           edges: !!(data && data.edges),
         };
-        if (this.instance) this.instance.applyConfig();
+        if (this.instance) this.instance.applyConfig(previous);
+        else if (content?.document) this.reload();
       },
 
       teardown() {
@@ -260,15 +255,19 @@
     // Per-document instance factory.
     // ============================================================
     function createInstance() {
+      const doc = content.document;
       const inst = {
         alive: true,
+        configured: false,
         // dirty: a theme-affecting change happened while the tab was hidden, so a
         // resample is owed on next foreground (background tabs never drawWindow).
         dirty: false,
         lastBg: null,
+        lastEdges: null,
         lastRescheduleAt: 0,
         observers: [],
         cleanups: [],          // listener removers, run on dispose
+        timers: new Set(),
         // live state
         liveTimer: null,
         liveAlwaysOn: false,
@@ -277,6 +276,29 @@
         liveVisibilityWired: false,
         liveVideoListenersWired: false,
       };
+
+      // content is a WindowProxy: navigation can replace its document while old
+      // callbacks still exist. Never let an old instance sample the replacement.
+      function isCurrent() {
+        return inst.alive && content?.document === doc;
+      }
+
+      function later(fn, ms) {
+        if (!isCurrent()) return null;
+        const timer = content.setTimeout(() => {
+          inst.timers.delete(timer);
+          if (isCurrent()) fn();
+        }, ms);
+        inst.timers.add(timer);
+        return timer;
+      }
+
+      function cancelTimer(timer) {
+        // Timer IDs belong to the inner window, so don't cancel a replacement
+        // document's unrelated timer with the same numeric ID.
+        if (content?.document === doc) { try { content.clearTimeout(timer); } catch {} }
+        inst.timers.delete(timer);
+      }
 
       // Register an event listener and remember how to remove it.
       function on(target, type, handler, opts) {
@@ -317,6 +339,40 @@
       // read as "selector is wrong" when it meant "nothing is playing";
       // once-per-tick at 4 Hz buries the console.
       let ambientLogKey = '';
+      let ambientContainer = null;
+      let ambientObserver = null;
+      let ambientVisible = false;
+      inst.cleanups.push(() => { ambientObserver?.disconnect(); ambientObserver = ambientContainer = null; });
+
+      function ambientIsVisible(container) {
+        return !!container?.checkVisibility({ opacityProperty: true, visibilityProperty: true });
+      }
+
+      function watchAmbientVisibility(container) {
+        if (container === ambientContainer) return;
+        ambientObserver?.disconnect();
+        ambientObserver = null;
+        ambientContainer = container;
+        ambientVisible = ambientIsVisible(container);
+        if (!container) return;
+        // YouTube keeps #cinematics in the DOM with visibility:hidden when the
+        // player setting is off. Visibility can be inherited from an ancestor;
+        // current YouTube toggles cinematics-active on ytd-watch-flexy. Watch the
+        // ancestor controls, not the animated canvas descendants. A paused player
+        // has no poll to catch this.
+        ambientObserver = new content.MutationObserver(() => {
+          if (!isCurrent() || !singleton.config.ytAmbient) return;
+          const visible = ambientIsVisible(container);
+          if (visible === ambientVisible) return;
+          ambientVisible = visible;
+          if (doc.visibilityState !== 'visible') inst.dirty = true;
+          else debouncedSample();
+        });
+        for (let node = container; node; node = node.parentElement) {
+          ambientObserver.observe(node, { attributes: true, attributeFilter:
+            ['style', 'class', 'hidden', 'cinematics-active', 'cinematics-enabled', 'fullscreen', 'theater'] });
+        }
+      }
 
       // Host gate, resolved once per document: readYouTubeAmbient() does DOM
       // lookups on every sample, so it must not run off YouTube. Covers
@@ -351,62 +407,56 @@
         } catch (e) { return null; }
       }
 
-      // Sample a wide central region, downsample into the grid, average non-
-      // transparent cells. Uses setTransform (not save/scale/restore) so that if
-      // drawWindow throws, the next call still starts from a clean identity
-      // transform instead of inheriting a leaked scale that breaks all sampling.
-      function readPixel() {
-        if (!ensureCanvas()) return null;
+      // Both pixel sources use viewport coordinates. Gecko's default drawWindow
+      // mode is document-relative and ignores scrolling, so the DRAW_VIEW flag is
+      // essential here, including for fixed/sticky players. Always restore the
+      // transform even when readback fails, since color normalization shares ctx.
+      function captureRect(sx, sy, sw, sh, asLight) {
+        if (!ensureCanvas() || !ctx.drawWindow) return null;
         try {
-          const w = content.innerWidth | 0;
-          const h = content.innerHeight | 0;
-          if (w <= 0 || h <= 0) return null;
-          if (!ctx.drawWindow) return null;
-
-          const sw = Math.max(8, (w * PIXEL_SAMPLE_FRACTION) | 0);
-          const sh = Math.max(8, (h * PIXEL_SAMPLE_FRACTION) | 0);
-          const sx = ((w - sw) / 2) | 0;
-          const sy = ((h - sh) / 2) | 0;
-
           ctx.setTransform(1, 0, 0, 1, 0, 0);
           ctx.clearRect(0, 0, PIXEL_SAMPLE_GRID, PIXEL_SAMPLE_GRID);
           ctx.setTransform(PIXEL_SAMPLE_GRID / sw, 0, 0, PIXEL_SAMPLE_GRID / sh, 0, 0);
-          ctx.drawWindow(content, sx, sy, sw, sh, 'rgba(0, 0, 0, 0)');
+          ctx.drawWindow(content, sx, sy, sw, sh, 'rgba(0, 0, 0, 0)', ctx.DRAWWINDOW_DRAW_VIEW);
           ctx.setTransform(1, 0, 0, 1, 0, 0);
 
           const img = ctx.getImageData(0, 0, PIXEL_SAMPLE_GRID, PIXEL_SAMPLE_GRID).data;
-          // Page samples default to the flat mean; the light model is opt-in.
-          return reduceGrid(img, PIXEL_SAMPLE_GRID, singleton.config.lightAverage, singleton.config.edges);
+          return reduceGrid(img, PIXEL_SAMPLE_GRID, asLight, singleton.config.edges);
         } catch (e) {
-          try { ctx.setTransform(1, 0, 0, 1, 0, 0); } catch {}
           return null;
+        } finally {
+          try { ctx.setTransform(1, 0, 0, 1, 0, 0); } catch {}
         }
+      }
+
+      // Page samples average the central 60% so edge furniture doesn't dominate.
+      function readPixel() {
+        const w = content.innerWidth | 0;
+        const h = content.innerHeight | 0;
+        if (w <= 0 || h <= 0) return null;
+        const sw = Math.max(1, (w * PIXEL_SAMPLE_FRACTION) | 0);
+        const sh = Math.max(1, (h * PIXEL_SAMPLE_FRACTION) | 0);
+        return captureRect(((w - sw) / 2) | 0, ((h - sh) / 2) | 0, sw, sh, singleton.config.lightAverage);
       }
 
       // Read the YouTube ambient-mode color.
       //
-      // WHY NOT THE CANVAS ITSELF: ambient mode paints downscaled video frames into
-      // canvases under #cinematics (two of them, 110x75, cross-faded) and CSS-blurs
-      // them into the glow around the player. Reading those directly is the obvious
-      // approach and it does not work: YouTube's video is served cross-origin from
-      // googlevideo.com without CORS, so the moment a frame lands the canvas is
-      // origin-tainted. YouTube can display it; nobody can read it back.
-      // getImageData throws SecurityError, verified in the wild — the canvas reads
-      // fine while blank, then dies exactly when playback starts.
+      // An earlier copy of YouTube's ambient canvas hit SecurityError once
+      // cross-origin video arrived. Capture the painted picture instead; our
+      // averaging is independent of YouTube's blur and cross-fade processing.
       //
       // WHAT WE DO INSTEAD: drawWindow the painted picture box of the <video>
       // element. drawWindow is the privileged compositor read the main pixel path
       // already relies on, so tainting simply does not apply. The colors are the
       // same source data ambient mode is built from — it's a copy of these frames —
       // and scoping to the video's own box keeps out everything a centered viewport
-      // grab drags in: comments, the recommendations column, the player chrome.
+      // grab drags in: comments and the recommendations column. Controls or
+      // subtitles overlaid on the picture can still affect this capture.
       //
-      // Letterboxing is handled better here than the canvas could have. The <video>
-      // box is sized to the player, so a 21:9 video inside it is bordered by black
-      // bars sitting right where the centered read looks. Deriving the picture box
-      // from videoWidth/videoHeight excludes them geometrically.
+      // Deriving the picture box from videoWidth/videoHeight excludes layout
+      // letterboxing. Black bars encoded into the video remain part of the sample.
       //
-      // Still gated on #cinematics existing, so this tracks YouTube's own Ambient
+      // Gated on #cinematics being visible, so this tracks YouTube's own Ambient
       // mode toggle: switch it off and the tint falls back to the normal chain.
       function readYouTubeAmbient() {
         if (ambientBlocked || !ensureCanvas()) return null;
@@ -416,25 +466,25 @@
 
           const container = doc.getElementById('cinematics');
           const video = doc.querySelector('#movie_player video') || doc.querySelector('video');
+          watchAmbientVisibility(container);
+          const enabled = ambientIsVisible(container);
 
           if (singleton.config.debug) {
             try {
-              // Report the pieces separately — "#cinematics ABSENT" means Ambient
-              // mode is off (or YouTube renamed it) while "present, no video box"
-              // means it's on but nothing is painted yet. Different fixes, so don't
-              // collapse them. Keyed so this logs on change, not every poll tick.
-              const key = `${!!container}:${!!video}:${inst.liveVideoIsPlaying}`;
+              // Distinguish an absent/hidden ambient layer from a player with no
+              // decoded frame. Log state changes rather than every poll tick.
+              const key = `${!!container}:${enabled}:${!!video}:${inst.liveVideoIsPlaying}`;
               if (key !== ambientLogKey) {
                 ambientLogKey = key;
                 console.log('[zen-page-tint frame] youtube ambient: #cinematics',
-                  container ? 'present' : 'ABSENT',
+                  container ? (enabled ? 'visible' : 'hidden') : 'ABSENT',
                   '| <video>', video ? 'found' : 'missing',
                   '| playing:', inst.liveVideoIsPlaying);
               }
             } catch {}
           }
 
-          if (!container || !video) return null;
+          if (!enabled || !video) return null;
 
           const vw = video.videoWidth | 0;
           const vh = video.videoHeight | 0;
@@ -467,16 +517,8 @@
           if (sy + sh > vph) sh = vph - sy;
           if (sw < 8 || sh < 8) return null;
 
-          ctx.setTransform(1, 0, 0, 1, 0, 0);
-          ctx.clearRect(0, 0, PIXEL_SAMPLE_GRID, PIXEL_SAMPLE_GRID);
-          ctx.setTransform(PIXEL_SAMPLE_GRID / sw, 0, 0, PIXEL_SAMPLE_GRID / sh, 0, 0);
-          ctx.drawWindow(content, sx, sy, sw, sh, 'rgba(0, 0, 0, 0)');
-          ctx.setTransform(1, 0, 0, 1, 0, 0);
-
-          // Always the light model regardless of the page-sample pref: this path is
-          // modelling light coming off a screen, which is the whole point.
-          const img = ctx.getImageData(0, 0, PIXEL_SAMPLE_GRID, PIXEL_SAMPLE_GRID).data;
-          return reduceGrid(img, PIXEL_SAMPLE_GRID, true, singleton.config.edges);
+          // Video samples always use the light model.
+          return captureRect(sx, sy, sw, sh, true);
         } catch (e) {
           try { ctx.setTransform(1, 0, 0, 1, 0, 0); } catch {}
           if (singleton.config.debug) {
@@ -582,13 +624,20 @@
       }
 
       // Different enough from the last sent color to be worth applying?
-      function significantChange(newBg) {
-        if (newBg === inst.lastBg) return false;
-        if (inst.lastBg === null || newBg === null) return true;
+      function colorChanged(next, previous) {
+        if (next === previous) return false;
+        if (!previous || !next) return true;
         const th = singleton.config.threshold;
         if (th <= 0) return true;
-        const d = maxChannelDelta(newBg, inst.lastBg);
+        const d = maxChannelDelta(next, previous);
         return d === null ? true : d >= th;
+      }
+
+      function significantChange(result) {
+        if (colorChanged(result.bg, inst.lastBg)) return true;
+        if (!singleton.config.edges) return false;
+        if (!!result.edges !== !!inst.lastEdges) return true;
+        return result.edges && ['l', 'r', 't', 'b'].some(key => colorChanged(result.edges[key], inst.lastEdges[key]));
       }
 
       // Returns true iff it actually sent an update. `allowNull` lets callers
@@ -597,23 +646,27 @@
       // (load/pageshow reschedule) re-evaluate and CAN send null to clear a
       // genuinely colorless page.
       function sample(force, allowNull = true) {
-        if (!inst.alive) return false;
+        if (!isCurrent()) return false;
+        // Each reload waits for the current request's config. Sampling with the
+        // previous request first would waste a readback that chrome must reject.
+        if (!inst.configured) { inst.dirty = true; return false; }
+        if (doc.visibilityState !== 'visible') { inst.dirty = true; return false; }
+        inst.dirty = false;
         const r = read();
         if (r.bg === null && !allowNull) return false;
-        if (!(force || significantChange(r.bg))) return false;
-        inst.lastBg = r.bg;
+        if (!(force || significantChange(r))) return false;
         try {
           sendAsyncMessage(MESSAGE_NAME, {
+            requestId: singleton.config.requestId,
             bg: r.bg,
-            // Directional colors for the ambient gradient, or null. The threshold
-            // check above deliberately looks at bg only: it's the dominant color and
-            // the edges move with it, so gating on both would fire far more often
-            // for a change nobody can see.
+            // Edges can change even when the whole-grid mean stays identical.
             edges: r.edges,
             source: r.source,
             href: content.location && content.location.href,
           });
-        } catch (e) { /* content torn down mid-send */ }
+        } catch (e) { return false; }
+        inst.lastBg = r.bg;
+        inst.lastEdges = r.edges;
         return true;
       }
 
@@ -621,32 +674,35 @@
         let timer = null;
         return () => {
           if (timer) return;
-          timer = content.setTimeout(() => { timer = null; if (inst.alive) fn(); }, ms);
+          timer = later(() => { timer = null; fn(); }, ms);
         };
       }
       const debouncedSample = debounce(() => sample(false), SAMPLE_DEBOUNCE_MS);
 
       // ---- Live mode (fixed-rate poll loop) ----
       function shouldPollNow() {
-        const doc = content.document;
-        return !!doc
+        return isCurrent()
+          && inst.configured
           && inst.liveRateMs > 0
           && doc.visibilityState === 'visible'
           && (inst.liveAlwaysOn || inst.liveVideoIsPlaying);
       }
       function stopPolling() {
-        if (inst.liveTimer) { try { content.clearTimeout(inst.liveTimer); } catch {} inst.liveTimer = null; }
+        if (inst.liveTimer) { cancelTimer(inst.liveTimer); inst.liveTimer = null; }
       }
       // One rate, the configured one. Whether a tick actually re-tints is decided
       // by the threshold in significantChange(), which is the right lever for
       // "don't churn on imperceptible jitter" — cadence and sensitivity stay
       // independent knobs instead of one silently driving the other.
       function scheduleNextPoll() {
-        inst.liveTimer = content.setTimeout(livePollTick, inst.liveRateMs);
+        inst.liveTimer = later(livePollTick, inst.liveRateMs);
       }
       function livePollTick() {
         inst.liveTimer = null;
-        if (!inst.alive || !shouldPollNow()) return;
+        if (!isCurrent()) return;
+        // Removing a playing video does not necessarily emit pause/ended.
+        if (!inst.liveAlwaysOn) checkVideoState();
+        if (!shouldPollNow()) return;
         sample(false);
         scheduleNextPoll();
       }
@@ -656,8 +712,7 @@
       }
 
       function checkVideoState() {
-        const doc = content.document;
-        if (!doc) { if (inst.liveVideoIsPlaying) { inst.liveVideoIsPlaying = false; updatePollingState(); } return; }
+        if (!isCurrent()) return;
         let anyPlaying = false;
         try {
           for (const v of doc.querySelectorAll('video')) {
@@ -697,13 +752,22 @@
       }
 
       // Re-evaluate live mode against the current persistent config.
-      function applyConfig() {
+      function applyConfig(previous) {
         const cfg = singleton.config;
+        const firstConfig = !inst.configured;
+        if (previous) inst.configured = true;
         inst.liveRateMs = cfg.liveRateMs > 0 ? Math.max(LIVE_RATE_FLOOR_MS, cfg.liveRateMs) : 0;
         inst.liveAlwaysOn = !!cfg.alwaysOn;
         wireVisibilityListener();
         if (!inst.liveAlwaysOn && inst.liveRateMs > 0) wireVideoDetection();
         updatePollingState();
+        // Initial script execution can beat the config handshake. A static page
+        // has no later poll to repair that sample, so publish once under the new
+        // request/config. Duplicate ready/config messages remain idempotent.
+        if (previous && (firstConfig || ['requestId', 'ytAmbient', 'lightAverage', 'edges'].some(key => previous[key] !== cfg[key]))
+          && doc.readyState !== 'loading') {
+          sample(true, doc.readyState === 'complete');
+        }
       }
 
       // Mutation observers. Background-tab mutations only mark dirty (no drawWindow);
@@ -722,13 +786,12 @@
 
         if (doc.head) {
           const onHeadMutation = (records) => {
-            if (content.document.visibilityState !== 'visible') { inst.dirty = true; return; }
             for (const r of records) {
               const t = r.target;
               const nn = (t && t.nodeName || '').toLowerCase();
               const pn = (t && t.parentNode && t.parentNode.nodeName || '').toLowerCase();
               if (nn === 'title' || pn === 'title') continue; // title text can't affect bg
-              debouncedSample();
+              onMutation();
               return;
             }
           };
@@ -736,10 +799,15 @@
           try {
             ho.observe(doc.head, {
               childList: true, subtree: true, characterData: true,
-              attributes: true, attributeFilter: ['href', 'content', 'media', 'disabled'],
+              attributes: true, attributeFilter: ['href', 'rel', 'content', 'media', 'disabled'],
             });
           } catch {}
           inst.observers.push(ho);
+          // Stylesheets may finish downloading after the mutation debounce. Only
+          // their load events matter here; ordinary image/script loads stay cheap.
+          on(doc.head, 'load', event => {
+            if (event.target?.localName === 'link' && event.target.relList?.contains('stylesheet')) onMutation();
+          }, { capture: true });
         }
       }
 
@@ -753,10 +821,10 @@
         const tryAttach = () => {
           if (!inst.alive) return;
           if (doc.body || ++tries > 20) { attachObservers(doc); return; } // ~3s cap
-          content.setTimeout(tryAttach, 150);
+          later(tryAttach, 150);
         };
         on(doc, 'DOMContentLoaded', tryAttach, { once: true, capture: true });
-        content.setTimeout(tryAttach, 150);
+        later(tryAttach, 150);
       }
 
       function start() {
@@ -778,8 +846,8 @@
           const now = Date.now();
           if (now - inst.lastRescheduleAt < 500) return;
           inst.lastRescheduleAt = now;
-          content.setTimeout(() => sample(true), 300);
-          content.setTimeout(() => sample(true), 2000);
+          later(() => sample(true), 300);
+          later(() => sample(true), 2000);
         };
         // No capture: a capture-phase window listener would fire for every
         // subresource (<img>/<script>/<iframe>) load, hammering drawWindow on
@@ -791,6 +859,7 @@
       function dispose() {
         inst.alive = false;
         stopPolling();
+        for (const timer of inst.timers) cancelTimer(timer);
         for (const off of inst.cleanups) { try { off(); } catch {} }
         inst.cleanups.length = 0;
         for (const o of inst.observers) { try { o.disconnect(); } catch {} }

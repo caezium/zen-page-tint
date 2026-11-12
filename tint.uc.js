@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Zen Page Tint
 // @description    Adaptive Zen chrome color from the active page
-// @version        2.0.1
+// @version        2.1.0
 // ==/UserScript==
 
 (() => {
@@ -15,8 +15,7 @@
   function prefInt(name, def) { try { return Services.prefs.getIntPref(name, def); } catch { return def; } }
   function prefStr(name, def) { try { return Services.prefs.getStringPref(name, def); } catch { return def; } }
 
-  // DEBUG is read from a pref so it can be toggled at runtime via about:config
-  // (zen.page-tint.debug = true). Defaults to false.
+  // Diagnostic and live-mode preferences are read once per script load.
   const DEBUG = prefBool('zen.page-tint.debug', false);
   const log = DEBUG ? (...args) => console.log('[zen-page-tint]', ...args) : () => {};
 
@@ -48,8 +47,8 @@
   // Disabling the master switch requires a Zen restart (config is pushed only at
   // frame-script load time). All polling is paused when the tab is backgrounded.
   const LIVE_MODE = prefBool('zen.page-tint.live-mode', true);
-  const LIVE_RATE_MS = prefInt('zen.page-tint.live-mode-rate-ms', 2000);
-  const LIVE_SMOOTH_MS = prefInt('zen.page-tint.live-mode-smoothing-ms', 1000);
+  const LIVE_RATE_MS = Math.max(100, prefInt('zen.page-tint.live-mode-rate-ms', 2000));
+  const LIVE_SMOOTH_MS = Math.max(0, prefInt('zen.page-tint.live-mode-smoothing-ms', 1000));
   const LIVE_ALWAYS_ON = prefBool('zen.page-tint.live-mode-always-on', false);
   const LIVE_HOSTS_RAW = prefStr('zen.page-tint.live-mode-hosts', '');
   const LIVE_THRESHOLD = prefInt('zen.page-tint.live-mode-threshold', 8);
@@ -69,8 +68,8 @@
   //     off we fall through to the normal sample chain.
   //   zen.page-tint.light-average    (bool, default false)
   //     Average PAGE samples as light rather than as flat color: decode sRGB to
-  //     linear before averaging and weight vivid cells above gray ones. More
-  //     accurate physically, and noticeably brighter/more saturated on mixed
+  //     linear before averaging and weight vivid cells above gray ones. The
+  //     extra chroma weight is an aesthetic choice and often brightens mixed
   //     pages — a mostly-dark page with bright content on it stops reading as
   //     dark, which is why it's off by default. The YouTube ambient path always
   //     uses this model regardless, since there it's modelling actual light.
@@ -89,7 +88,7 @@
   //     theme/gradient shows through; in between veils the gradient with the page
   //     color. Done as an overlay (not a solid color blend) precisely because a
   //     workspace gradient is a gradient, not a single color, so it can't be
-  //     reproduced by mixing one color — see style.css --zpt-tint / the rim rule.
+  //     reproduced by mixing one color — see style.css's backdrop overlays.
   //   zen.page-tint.frame-gap    (int px, default 5) → --zpt-frame-gap
   //     Non-compact only: compact mode stays flush so Zen's screen-edge hover
   //     targets remain reachable.
@@ -132,10 +131,7 @@
   let BRIGHTNESS = clampInt(prefInt('zen.page-tint.brightness', 100), 0, 300);
   let CONTRAST = clampInt(prefInt('zen.page-tint.contrast', 100), 0, 300);
   let AMBIENT_SPREAD = clampInt(prefInt('zen.page-tint.ambient-spread', 0), 0, 100);
-  // Ceiling on the gradient overlay's alpha. Full opacity would let an edge color
-  // completely replace the base tint at the extremes, which breaks the readable-
-  // foreground pick (that's computed against the base). Capping keeps the endpoints
-  // tethered to the base so text contrast survives at any spread.
+  // Maximum directional overlay; edgeStop further limits it for text contrast.
   const EDGE_ALPHA_MAX = 0.7;
 
   // Host-pattern matching. Supports exact-host and leading-wildcard patterns
@@ -180,27 +176,86 @@
   const GLANCE_TAB_ATTRIBUTE = 'zen-glance-tab';
   const FRAME_SCRIPT_URL = 'chrome://sine/content/zen-page-tint/frame.js';
   const root = document.documentElement;
+  const controllerId = window.crypto.randomUUID();
+  let disposed = false;
+  const originalStyles = new Map([
+    '--zen-tab-header-background', '--zen-tab-header-foreground',
+    '--zpt-strength', '--zpt-color', '--zpt-live-smoothing-ms',
+    '--zpt-frame-gap', '--zpt-frame-radius',
+    '--zpt-edge-l', '--zpt-edge-r', '--zpt-edge-t', '--zpt-edge-b',
+  ].map(name => [name, [root.style.getPropertyValue(name), root.style.getPropertyPriority(name)]]));
+  function restoreStyle(name) {
+    const [value, priority] = originalStyles.get(name);
+    if (value) root.style.setProperty(name, value, priority);
+    else root.style.removeProperty(name);
+  }
+  const tintBackdrops = [];
+  const backdropParents = new WeakSet();
+  let windowBackdrop = null;
+  let ambientClipRaf = 0;
+  const backdropResizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(updateAmbientClip) : null;
 
-  // Smoothing transitions are always armed, so the smoothing variable is set
-  // unconditionally.
-  root.style.setProperty('--zpt-live-smoothing-ms', `${LIVE_SMOOTH_MS}ms`);
+  function updateAmbientClip() {
+    if (disposed || !windowBackdrop) return;
+    const navbar = document.querySelector('#zen-appcontent-navbar-wrapper');
+    const floating = root.getAttribute('zen-compact-mode') === 'true' && prefBool('zen.view.compact.hide-toolbar', true);
+    if (!AMBIENT_SPREAD || !navbar || floating || root.getAttribute('zen-single-toolbar') === 'true') {
+      windowBackdrop.style.removeProperty('--zpt-ambient-clip');
+      windowBackdrop.style.removeProperty('--zpt-navbar-inset');
+      windowBackdrop.style.removeProperty('--zpt-navbar-display');
+      return;
+    }
+    // Both gradient axes live inside the window overlay so opacity applies to
+    // their combined result exactly once. Give its horizontal pseudo-element the
+    // navbar rectangle and cut that rectangle out of the vertical one.
+    const bar = navbar.getBoundingClientRect();
+    const bounds = windowBackdrop.getBoundingClientRect();
+    const left = bar.left - bounds.left, top = bar.top - bounds.top;
+    const right = left + bar.width, bottom = top + bar.height;
+    windowBackdrop.style.setProperty('--zpt-ambient-clip',
+      `polygon(evenodd, 0 0, 100% 0, 100% 100%, 0 100%, 0 0, ${left}px ${top}px, ${right}px ${top}px, ${right}px ${bottom}px, ${left}px ${bottom}px, ${left}px ${top}px)`);
+    windowBackdrop.style.setProperty('--zpt-navbar-inset',
+      `${top}px ${bounds.width - right}px ${bounds.height - bottom}px ${left}px`);
+    windowBackdrop.style.setProperty('--zpt-navbar-display', 'block');
+  }
 
-  // Tint strength / frame gap / radius are pref-driven (Sine settings panel);
-  // apply at startup.
-  applyCssVarPrefs();
-
-  // Persistent "mod is active in this window" marker. Smoothing transitions are
-  // armed against THIS attribute (not zen-page-tint) so they survive leaving a
-  // tinted page for about:/chrome:. Removed only on cleanup.
-  root.setAttribute('zen-page-tint-active', 'on');
-  if (LIVE_MODE) root.setAttribute('zen-page-tint-live', 'on');
+  function installBackdrops() {
+    if (disposed) return;
+    // These are leaf surfaces: exactly one tint coat above each native workspace
+    // or floating-panel backdrop. No ancestor-depth estimate or inherited color
+    // animation is needed, and Zen continues to own panel geometry and materials.
+    for (const parent of document.querySelectorAll('#zen-browser-background, .zen-toolbar-background')) {
+      if (backdropParents.has(parent)) continue;
+      const overlay = document.createElementNS('http://www.w3.org/1999/xhtml', 'div');
+      overlay.className = 'zen-page-tint-backdrop';
+      overlay.setAttribute('aria-hidden', 'true');
+      parent.appendChild(overlay);
+      if (parent.id === 'zen-browser-background') windowBackdrop = overlay;
+      tintBackdrops.push(overlay);
+      backdropParents.add(parent);
+      chromeThemeObserver.observe(parent, { attributes: true, attributeFilter: ['style'] });
+    }
+    const navbar = document.querySelector('#zen-appcontent-navbar-wrapper');
+    if (navbar) backdropResizeObserver?.observe(navbar);
+    if (windowBackdrop) backdropResizeObserver?.observe(windowBackdrop);
+    updateAmbientClip();
+    // Zen updates root layout attributes before pref-dependent CSS margins have
+    // settled. Measure again on the next frame; a position-only change does not
+    // notify ResizeObserver, even though it moves the ambient cutout.
+    if (windowBackdrop && !ambientClipRaf) {
+      ambientClipRaf = requestAnimationFrame(() => {
+        ambientClipRaf = 0;
+        updateAmbientClip();
+      });
+    }
+  }
 
   function isInternalUrl(url) {
     return !url || url.startsWith('about:') || url.startsWith('chrome:');
   }
 
-  // Cache: origin+path → bg string (canonical rgb()). Bounded LRU (true access-order).
-  // Only `bg` is stored; `fg` is derived deterministically via readableFg(bg).
+  // Full URL → raw color + edges. Query strings and fragments can select different
+  // videos or SPA routes; they must not share a cached theme.
   const themeCache = new Map();
   // Sized above the heavy-tab working set (the project targets 1300+ tabs). A
   // smaller cap thrashes: cycling more distinct URLs than the cap forces most tab
@@ -214,13 +269,21 @@
     return m ? { r: +m[1], g: +m[2], b: +m[3] } : null;
   }
 
-  // Pick black or white text for max contrast (Rec 601 luminance). The frame
-  // script normalizes ALL bg values to canonical rgb() before sending.
+  // WCAG relative luminance uses linear sRGB, not the gamma-encoded Rec 601
+  // shortcut (which picks low-contrast white text on red and middle gray).
+  function luminance(rgb) {
+    const linear = v => {
+      const s = v / 255;
+      return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+    };
+    return 0.2126 * linear(rgb.r) + 0.7152 * linear(rgb.g) + 0.0722 * linear(rgb.b);
+  }
+
   function readableFg(bg) {
     const rgb = parseRgb(bg);
     if (!rgb) return null;
-    const lum = (0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b) / 255;
-    return lum > 0.55 ? '#000' : '#fff';
+    const lum = luminance(rgb);
+    return (lum + 0.05) / 0.05 >= 1.05 / (lum + 0.05) ? '#000' : '#fff';
   }
 
   // ---- HSL conversion (for the saturation / lightness-clamp adjustments) ----
@@ -279,42 +342,25 @@
     return `rgb(${out.r}, ${out.g}, ${out.b})`;
   }
 
-  // ---- Opaque pre-blend (tint strength) ----
-  //
-  // Strength used to be an ALPHA: --zpt-tint was the page color at that opacity,
-  // laid over Zen's chrome so the workspace gradient showed through. That model is
-  // depth-dependent, and Zen's chrome nests four deep, so painting the same
-  // translucent color on an element and its ancestors composites to 1-(1-s)^depth
-  // rather than s. Two consequences, both bad: surfaces at different depths
-  // resolved to visibly different colors (the sidebar vs the frame around the
-  // page), and the slider was badly miscalibrated — at depth 4, strength 50
-  // rendered 94% and anything above ~40 was indistinguishable from 100.
-  //
-  // Now the blend happens here and the painted color is OPAQUE. An opaque color
-  // painted by four nested elements looks identical to one painted once, so depth
-  // stops mattering entirely and strength 50 means 50.
-  //
-  // Tradeoff, deliberately accepted: Zen's workspace gradient no longer shows
-  // through below 100 — you get a blend against its flat base color instead. In
-  // practice the gradient was only 6% visible at strength 50 under the old model,
-  // so little is lost.
-
-  // Zen's chrome base, resolved to rgb. getPropertyValue() hands back custom
-  // properties as unresolved token streams (light-dark(...), color-mix(...)), so
-  // read it through a throwaway element whose `color` computes to a real value.
-  // Cached because this forces a style flush; invalidated on color-scheme change.
+  // Approximate the visible surface for foreground selection only. The painted
+  // tint stays translucent, preserving workspace gradients. A gradient cannot be
+  // used as a CSS color; fall back to Canvas when the background has no solid base.
   let chromeBaseCache = null;
   function chromeBaseColor() {
     if (chromeBaseCache) return chromeBaseCache;
+    let probe;
     try {
-      const probe = document.createElement('div');
+      probe = document.createElementNS('http://www.w3.org/1999/xhtml', 'div');
       probe.style.cssText = 'position:fixed;width:0;height:0;opacity:0;pointer-events:none;'
-        + 'color:var(--zen-main-browser-background)';
-      root.appendChild(probe);
-      const resolved = getComputedStyle(probe).color;
-      probe.remove();
+        + 'color:Canvas;background:var(--zen-main-browser-background)';
+      // Workspace colors are local to this backdrop in current Zen releases.
+      (document.querySelector('#zen-browser-background') || root).appendChild(probe);
+      const style = getComputedStyle(probe);
+      const background = style.backgroundColor;
+      const resolved = background?.startsWith('rgb(') ? background : style.color;
       if (parseRgb(resolved)) chromeBaseCache = resolved;
     } catch (e) { log('chrome base probe failed', e); }
+    finally { probe?.remove(); }
     return chromeBaseCache;
   }
 
@@ -337,49 +383,55 @@
   // Alpha carries the spread strength, so the compositor does the base↔edge blend
   // and JS never has to lerp — and at spread 0 the attribute gate below removes the
   // gradient rules entirely rather than painting a no-op.
-  //
-  // Scaled by MIX_AMOUNT as well, because the edges are a deviation FROM the base
-  // surface and that surface composites to MIX_AMOUNT. Pinning edge alpha to spread
-  // alone holds them at full opacity while the base fades: measured at strength 50 /
-  // spread 100, the stops painted at 0.7 over a base whose per-layer alpha was 0.159,
-  // so the ends of the sidebar read as separate blocks of color against a nearly
-  // untinted middle. Scaling keeps the pair proportional, which also makes spread and
-  // strength independent knobs — spread sets how much directional variation you see
-  // relative to the tint, not in absolute terms.
-  function edgeStop(color) {
+  // The whole overlay carries MIX_AMOUNT, including this gradient. Applying
+  // strength independently to the base and edges would compound their opacity.
+  function edgeStop(color, surface, foreground) {
     const rgb = parseRgb(color);
     if (!rgb) return null;
-    const alpha = (AMBIENT_SPREAD / 100) * EDGE_ALPHA_MAX * (MIX_AMOUNT / 100);
-    return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${alpha.toFixed(3)})`;
+    let alpha = (AMBIENT_SPREAD / 100) * EDGE_ALPHA_MAX;
+    const base = parseRgb(surface);
+    // Contrast is evaluated after the group's opacity composites over Zen.
+    const visibleEdge = parseRgb(blendToChromeBase(color, MIX_AMOUNT));
+    const light = amount => luminance({
+      r: base.r + (visibleEdge.r - base.r) * amount,
+      g: base.g + (visibleEdge.g - base.g) * amount,
+      b: base.b + (visibleEdge.b - base.b) * amount,
+    });
+    const readable = amount => {
+      const lum = light(amount);
+      return (foreground === '#000' ? (lum + 0.05) / 0.05 : 1.05 / (lum + 0.05)) >= 4.5;
+    };
+    // A fixed 0.7 cap alone can still put white text over an almost-white edge.
+    // For black text, complementary colors can also darken the middle of the
+    // gradient despite readable endpoints. Luminance along an sRGB segment is
+    // convex, so find its minimum before limiting the overlay to the first safe
+    // contrast crossing. For white text the worst luminance is at an endpoint.
+    let limit = alpha;
+    if (base && foreground === '#000') {
+      let low = 0, high = alpha;
+      for (let i = 0; i < 18; i++) {
+        const a = low + (high - low) / 3, b = high - (high - low) / 3;
+        if (light(a) < light(b)) high = b;
+        else low = a;
+      }
+      const minimum = (low + high) / 2;
+      if (!readable(minimum)) limit = minimum;
+    }
+    if (base && !readable(limit)) {
+      let low = 0, high = limit;
+      for (let i = 0; i < 12; i++) {
+        const middle = (low + high) / 2;
+        if (readable(middle)) low = middle;
+        else high = middle;
+      }
+      alpha = low;
+    }
+    return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${Math.floor(alpha * 1000) / 1000})`;
   }
 
-  // Push the CSS-var appearance prefs into their variables, overriding the
-  // stylesheet defaults. Idempotent — safe to call on every pref change.
-  //   --zpt-strength is the tint OVERLAY opacity (consumed by style.css's
-  //   --zpt-tint / the rim box-shadow): 100% = opaque page tint, 0% = none.
-  // How many times the tint gets painted over any given pixel. Zen's chrome nests
-  // #main-window > #browser > (#appcontent | #navigator-toolbox > #titlebar), and
-  // the surround picks up a 4th coat from the ring box-shadow, so every surface
-  // lands on 4. Boxes that would have been a 5th (the sidebar button boxes, the
-  // media card) are held transparent in style.css specifically to keep this uniform.
-  //
-  // It has to be uniform for the compensation below to work. If a future Zen
-  // release re-nests the chrome, the symptom is surfaces disagreeing again below
-  // full strength — the layer dump under `debug` is what to check.
-  const TINT_DEPTH = 4;
-
-  // Per-layer alpha that composites to MIX_AMOUNT across TINT_DEPTH layers.
-  // Stacking alpha is 1-(1-a)^n, so inverting gives a = 1-(1-s)^(1/n). Without
-  // this the slider was wildly non-linear: 50 rendered as 94%, and everything past
-  // ~40 was indistinguishable from fully opaque.
-  function compensatedStrength(amount) {
-    const s = Math.max(0, Math.min(1, amount / 100));
-    if (s >= 1) return 100;
-    return (1 - Math.pow(1 - s, 1 / TINT_DEPTH)) * 100;
-  }
-
+  // Each native backdrop gets one coat, so strength is the actual overlay alpha.
   function applyCssVarPrefs() {
-    root.style.setProperty('--zpt-strength', `${compensatedStrength(MIX_AMOUNT).toFixed(2)}%`);
+    root.style.setProperty('--zpt-strength', `${MIX_AMOUNT}%`);
     root.style.setProperty('--zpt-frame-gap', `${Math.max(0, prefInt('zen.page-tint.frame-gap', 5))}px`);
     root.style.setProperty('--zpt-frame-radius', `${Math.max(0, prefInt('zen.page-tint.frame-radius', 14))}px`);
   }
@@ -397,16 +449,21 @@
   }
 
   function renderTint(rawBg, rawEdges) {
+    updateAmbientClip();
     if (rawBg && MIX_AMOUNT > 0) {
       // The painted value stays the full page color; CSS applies strength as alpha
-      // (--zpt-strength, already depth-compensated). The FOREGROUND pick, though,
+      // (--zpt-strength). The FOREGROUND pick, though,
       // has to run against an approximation of what actually lands on screen —
       // below full strength that's the page color composited over Zen's base, so
       // picking contrast against the raw page color could put black text on chrome
       // that has already gone dark.
       const tint = transformColor(rawBg);
-      const fg = readableFg(blendToChromeBase(tint, MIX_AMOUNT)) || 'inherit';
+      const surface = blendToChromeBase(tint, MIX_AMOUNT);
+      const fg = readableFg(surface) || 'inherit';
       root.style.setProperty('--zen-tab-header-background', tint);
+      // Retain the last leaf color while fading out; restoring Zen's own header
+      // variable must not change the color halfway through that fade.
+      root.style.setProperty('--zpt-color', tint);
       root.style.setProperty('--zen-tab-header-foreground', fg);
       root.setAttribute('zen-page-tint', 'on');
 
@@ -419,11 +476,9 @@
         let ok = true;
         const stops = {};
         for (const key of Object.keys(EDGE_VARS)) {
-          // Edge alpha carries spread AND strength (see edgeStop): the stop overlays
-          // a surface that itself composites to MIX_AMOUNT, so holding the deviation
-          // at full opacity while the surface fades is what made the sidebar ends
-          // read as blocks of unrelated color at low strength.
-          const stop = rawEdges[key] ? edgeStop(transformColor(rawEdges[key])) : null;
+          // Spread is internal to the tint; the leaf's opacity applies strength
+          // once to the base plus gradient, preserving the native theme beneath.
+          const stop = rawEdges[key] ? edgeStop(transformColor(rawEdges[key]), surface, fg) : null;
           if (!stop) { ok = false; break; }
           stops[key] = stop;
         }
@@ -437,20 +492,14 @@
         clearEdgeVars();
       }
     } else {
-      root.style.removeProperty('--zen-tab-header-background');
-      root.style.removeProperty('--zen-tab-header-foreground');
+      restoreStyle('--zen-tab-header-background');
+      restoreStyle('--zen-tab-header-foreground');
       root.removeAttribute('zen-page-tint');
       clearEdgeVars();
     }
   }
 
-  // One-shot diagnostic: report what each chrome layer actually paints once a tint
-  // is live. The rim and the sidebar can resolve to different opacities depending
-  // on how many ancestors happen to paint the translucent tint over a given pixel,
-  // and that stack can't be derived reliably from Zen's stylesheets — some of it is
-  // native macOS material (#zen-browser-background uses -moz-default-appearance),
-  // which doesn't composite like a CSS background. So read the computed values
-  // instead of inferring them. DEBUG-gated and fires once per window.
+  // One-shot diagnostic of the native surfaces and our leaf overlays.
   let dumpedChromeLayers = false;
   function dumpChromeLayers() {
     if (!DEBUG || dumpedChromeLayers) return;
@@ -458,7 +507,7 @@
     try {
       const rs = getComputedStyle(root);
       const lines = ['[zen-page-tint] chrome layer dump'];
-      for (const v of ['--zpt-tint', '--zpt-strength', '--zen-tab-header-background']) {
+      for (const v of ['--zpt-color', '--zpt-strength', '--zen-tab-header-background']) {
         lines.push(`  ${v} = ${rs.getPropertyValue(v).trim() || '(unset)'}`);
       }
       const trim = (s, n) => (s && s !== 'none' ? String(s).slice(0, n) : s);
@@ -478,6 +527,7 @@
       const bgEl = document.querySelector('#zen-browser-background');
       report('#zen-browser-background::before', bgEl, '::before');
       report('#zen-browser-background::after', bgEl, '::after');
+      tintBackdrops.forEach((overlay, i) => report(`tint overlay ${i}`, overlay));
       console.log(lines.join('\n'));
     } catch (e) { log('chrome layer dump failed', e); }
   }
@@ -514,7 +564,7 @@
   }
 
   function cacheKey(uri) {
-    try { const u = new URL(uri); return u.origin + u.pathname; }
+    try { return new URL(uri).href; }
     catch { return uri || ''; }
   }
 
@@ -530,12 +580,27 @@
     themeCache.set(key, value);
   }
 
-  // Per-browser record: { mm, listener, loaded }. Keyed by browser element (weak),
-  // but we track the messageManager identity too: a discarded/restored tab,
+  // Per-browser transport, request identity, and last sample. Keyed weakly by
+  // browser element, but we track the messageManager identity too: a discarded/restored tab,
   // remoteness change, or tab tear-off recreates the mm, and the listener must be
   // re-attached to the live one (the old "have we attached?" boolean guard left
   // restored tabs with no listener at all).
   const browserState = new WeakMap();
+  let nextRequestId = 0;
+  let sourceRevision = 0;
+
+  function documentId(browser) {
+    return browser.browsingContext?.currentWindowGlobal?.innerWindowId ?? null;
+  }
+
+  function invalidateSamples() {
+    // Old background samplers must not repopulate a cleared cache with samples
+    // produced under the previous color-source settings. Update them lazily on
+    // selection so this never instantiates session-restore browsers.
+    sourceRevision++;
+    themeCache.clear();
+    scheduleSample(true);
+  }
 
   // A transient Zen Glance is selected like a normal browser, but Zen still shows
   // its parent page behind the overlay. Keep the shared chrome on the parent's
@@ -548,25 +613,34 @@
 
   function makeListener(browser) {
     return (msg) => {
+      if (disposed) return;
       const theme = msg.data || {};
+      const rec = browserState.get(browser);
+      if (!rec || rec.sourceRevision !== sourceRevision || theme.requestId !== rec.requestId
+        || rec.documentId !== documentId(browser)) return;
       const current = browser.currentURI?.spec || '';
       // Key by the URL the sample was actually taken from (sent as href), not the
       // browser's current URI — an in-flight sample from the previous document can
       // arrive after navigation, and must not be cached/applied under the new URL.
-      const sampled = theme.href || current;
+      const sampled = theme.href;
       if (isInternalUrl(sampled) || hostMatches(sampled, DISABLE_HOSTS)) return;
       const key = cacheKey(sampled);
       const isCurrent = cacheKey(current) === key;
+      if (!isCurrent) return;
       const canApply = isCurrent && gBrowser.selectedBrowser === browser && !isTransientGlance(browser);
       log('message received', { source: theme.source, bg: theme.bg, url: sampled });
+      // Same-URL tabs can show different video frames, scroll positions, or app
+      // state. Keep this document's own result, including an explicit null color,
+      // so the shared URL cache cannot overwrite it on the next tab switch.
+      rec.sample = { key, theme: theme.bg ? { bg: theme.bg, edges: theme.edges || null } : null };
 
       if (theme.bg) {
         // Cache the whole sampled theme (color + directional edges), not just the
         // color: a cache hit has to be able to restore the gradient too, or
         // revisiting a tab would silently drop to a flat tint.
-        cacheSet(key, { bg: theme.bg, edges: theme.edges || null });
+        cacheSet(key, rec.sample.theme);
         if (canApply) {
-          applyTheme({ bg: theme.bg, edges: theme.edges || null });
+          applyTheme(rec.sample.theme);
           log('applied', { bg: theme.bg, edges: !!theme.edges });
         }
       } else if (canApply) {
@@ -602,7 +676,9 @@
     // attach to the live mm.
     removeListeners(rec);
     const listener = makeListener(browser);
-    const readyListener = () => { log('frame script ready; pushing config'); sendConfig(browser); };
+    const readyListener = () => {
+      if (!disposed && browserState.get(browser)?.mm === mm) sendConfig(browser);
+    };
     try {
       mm.addMessageListener(MESSAGE_NAME, listener);
       mm.addMessageListener(READY_MESSAGE_NAME, readyListener);
@@ -612,10 +688,12 @@
       // leaving a record with loaded:true that makes the cache-hit path skip the
       // frame-script reload for this (still-unlistened) browser.
       log('listener attach failed', e);
+      removeListeners({ mm, listener, readyListener });
       browserState.delete(browser);
       return null;
     }
-    rec = { mm, listener, readyListener, loaded: false };
+    rec = { mm, listener, readyListener, loaded: false, requestId: null,
+      sourceRevision: -1, documentId: null, urlKey: null, sample: null };
     browserState.set(browser, rec);
     log('listener attached');
     return rec;
@@ -627,11 +705,13 @@
   // non-live settings below it, silently pinning them to the frame script's
   // built-in defaults for anyone running with live mode off.
   function sendConfig(browser) {
-    const mm = browser.messageManager;
-    if (!mm?.sendAsyncMessage) return;
+    const rec = browserState.get(browser);
+    const mm = rec?.mm;
+    if (disposed || !mm?.sendAsyncMessage || rec.sourceRevision !== sourceRevision) return;
     try {
       const url = browser.currentURI?.spec || '';
       mm.sendAsyncMessage(CONFIG_MESSAGE_NAME, {
+        requestId: rec.requestId,
         liveRateMs: LIVE_MODE ? LIVE_RATE_MS : 0,
         alwaysOn: LIVE_ALWAYS_ON || hostMatches(url, LIVE_HOSTS),
         threshold: LIVE_THRESHOLD,
@@ -648,28 +728,32 @@
   // frame.js's globalThis guard makes a repeat load cheap (it just re-samples the
   // current document). Marks the record loaded so cache hits can skip re-loading.
   function loadFrameScript(browser) {
-    const mm = browser.messageManager;
+    const rec = ensureAttached(browser);
+    const mm = rec?.mm;
     if (!mm?.loadFrameScript) return;
+    rec.requestId = `${controllerId}:${++nextRequestId}`;
+    rec.sourceRevision = sourceRevision;
+    rec.documentId = documentId(browser);
+    rec.urlKey = cacheKey(browser.currentURI?.spec || '');
+    rec.sample = null;
+    rec.loaded = false;
     try {
       mm.loadFrameScript(FRAME_SCRIPT_URL, false);
       sendConfig(browser);
-      const rec = browserState.get(browser);
-      if (rec) rec.loaded = true;
+      rec.loaded = true;
       log('frame script load requested');
     } catch (e) { log('frame script load failed', e); }
   }
 
   function detachBrowser(browser) {
     if (!browser) return;
-    removeListeners(browserState.get(browser));
+    const rec = browserState.get(browser);
+    removeListeners(rec);
+    if (rec?.loaded) {
+      try { rec.mm.sendAsyncMessage(TEARDOWN_MESSAGE_NAME, {}); } catch {}
+    }
     browserState.delete(browser);
     log('detached');
-  }
-
-  function sendTeardown(browser) {
-    const mm = browser.messageManager;
-    if (!mm?.sendAsyncMessage) return;
-    try { mm.sendAsyncMessage(TEARDOWN_MESSAGE_NAME, {}); } catch {}
   }
 
   function sampleAndApply(browser, forceFresh = false) {
@@ -681,15 +765,26 @@
     const url = browser.currentURI?.spec || '';
 
     // Internal pages and per-site-disabled hosts keep Zen's own chrome (no tint).
-    if (isInternalUrl(url) || hostMatches(url, DISABLE_HOSTS)) { applyTheme(null); return; }
+    if (isInternalUrl(url) || hostMatches(url, DISABLE_HOSTS)) {
+      detachBrowser(browser);
+      applyTheme(null);
+      return;
+    }
 
     const key = cacheKey(url);
 
     if (forceFresh) {
       // Pre-delete so a fast subsequent TabSelect doesn't read the stale value.
       themeCache.delete(key);
-      ensureAttached(browser);
       loadFrameScript(browser);
+      return;
+    }
+
+    const rec = ensureAttached(browser);
+    const currentSampler = rec?.loaded && rec.sourceRevision === sourceRevision
+      && rec.documentId === documentId(browser) && rec.urlKey === key;
+    if (currentSampler && rec.sample?.key === key) {
+      applyTheme(rec.sample.theme);
       return;
     }
 
@@ -701,13 +796,13 @@
       // mm was recreated). Ensure the listener is live, and load the frame script
       // once if it isn't already running — otherwise that tab gets the static tint
       // but no mutation/live-mode updates. Repeat visits keep the fast path.
-      const rec = ensureAttached(browser);
-      if (rec && !rec.loaded) loadFrameScript(browser);
+      if (rec && !currentSampler) {
+        loadFrameScript(browser);
+      }
       return;
     }
 
     // Cache miss: need a sample.
-    ensureAttached(browser);
     loadFrameScript(browser);
   }
 
@@ -717,7 +812,7 @@
   // wins and cancels the other.
   const SCHEDULE_SAFETY_MS = 100;
   let scheduled = false;
-  let scheduledForce = false;
+  let scheduledForceBrowser = null;
   let scheduleRafId = 0;
   let scheduleTimerId = 0;
   function runScheduled() {
@@ -727,12 +822,13 @@
     try { if (scheduleTimerId) clearTimeout(scheduleTimerId); } catch {}
     scheduleRafId = 0;
     scheduleTimerId = 0;
-    const force = scheduledForce;
-    scheduledForce = false;
+    const force = scheduledForceBrowser === gBrowser.selectedBrowser;
+    scheduledForceBrowser = null;
     sampleAndApply(gBrowser.selectedBrowser, force);
   }
   function scheduleSample(forceFresh = false) {
-    if (forceFresh) scheduledForce = true;
+    if (disposed) return;
+    if (forceFresh) scheduledForceBrowser = gBrowser.selectedBrowser;
     if (scheduled) return;
     scheduled = true;
     scheduleRafId = requestAnimationFrame(runScheduled);
@@ -764,9 +860,12 @@
   // onLocationChange: top-level navigation/reload in active tab — bypass cache.
   const progressListener = {
     QueryInterface: ChromeUtils.generateQI(['nsIWebProgressListener', 'nsISupportsWeakReference']),
-    onLocationChange(progress, request, location, flags) {
+    onLocationChange(progress, request, location, flags, isTabSwitch = false) {
       if (!progress?.isTopLevel) return;
-      if (flags & Ci.nsIWebProgressListener.LOCATION_CHANGE_SAME_DOCUMENT) return;
+      // tabbrowser.updateCurrentBrowser synthesizes this event with a fifth
+      // argument on TabSelect. Treating it as navigation defeats every cache hit.
+      if (isTabSwitch) return;
+      // pushState/hash routes can change a static page without a theme mutation.
       scheduleSample(true);
     },
     onStateChange() {}, onProgressChange() {}, onStatusChange() {},
@@ -774,9 +873,29 @@
   };
   gBrowser.addProgressListener(progressListener);
 
-  // Initial run after the window finishes loading.
-  if (document.readyState === 'complete') scheduleSample(false);
-  else window.addEventListener('load', () => scheduleSample(false), { once: true });
+  const onWindowLoad = () => { installBackdrops(); scheduleSample(false); };
+
+  // Watch only native theme inputs, excluding every variable this mod writes.
+  // Workspace/theme changes can alter the contrast needed for the same page.
+  function nativeThemeSignature() {
+    const elements = [root, ...document.querySelectorAll('#zen-browser-background, .zen-toolbar-background')];
+    return elements.map(el => ['--zen-main-browser-background', '--zen-main-browser-background-toolbar',
+      '--zen-primary-color', '--toolbar-color-scheme'].map(name => el.style.getPropertyValue(name)).join('|')).join(';')
+      + ['class', 'theme-effective-id', 'theme-in-app', 'zen-single-toolbar', 'zen-compact-mode', 'zen-right-side']
+        .map(name => root.getAttribute(name)).join('|');
+  }
+  let nativeThemeSig = nativeThemeSignature();
+  const chromeThemeObserver = new MutationObserver(() => {
+    if (disposed) return;
+    const signature = nativeThemeSignature();
+    if (signature === nativeThemeSig) return;
+    nativeThemeSig = signature;
+    installBackdrops();
+    chromeBaseCache = null;
+    if (MIX_AMOUNT > 0 && MIX_AMOUNT < 100) reapplyTint();
+  });
+  chromeThemeObserver.observe(root, { attributes: true,
+    attributeFilter: ['style', 'class', 'theme-effective-id', 'theme-in-app', 'zen-single-toolbar', 'zen-compact-mode', 'zen-right-side'] });
 
   // OS color scheme change: every cached entry is now stale. Clear and re-sample.
   let colorSchemeQuery = null;
@@ -784,12 +903,12 @@
   try {
     colorSchemeQuery = window.matchMedia('(prefers-color-scheme: dark)');
     onColorSchemeChange = () => {
-      themeCache.clear();
       // Zen's chrome base is light-dark(), so it flips with the scheme — the cached
       // probe result is stale the moment this fires.
       chromeBaseCache = null;
       log('color-scheme changed, cache cleared');
-      scheduleSample(true);
+      reapplyTint();
+      invalidateSamples();
     };
     colorSchemeQuery.addEventListener('change', onColorSchemeChange);
   } catch {}
@@ -834,16 +953,15 @@
           // all, so cached entries are now the wrong shape. Within a non-zero range
           // only the overlay alpha changes, which is a pure re-render.
           //
-          // Clearing the cache is the ONLY propagation needed: every tab becomes a
-          // miss, and the miss path already calls loadFrameScript() → sendConfig().
+          // Cache invalidation and a revision change propagate settings lazily.
           // Do NOT iterate gBrowser.browsers to push config eagerly — that touches
           // .messageManager on every tab, which instantiates lazy session-restore
           // browsers and floods IPC. At this project's target tab counts it hangs the
           // window outright (observed at ~1660 tabs). scheduleSample handles the tab
           // the user is actually looking at; the rest fix themselves on select.
           if (wasOn !== (AMBIENT_SPREAD > 0)) {
-            themeCache.clear();
-            scheduleSample(true);
+            reapplyTint();
+            invalidateSamples();
           } else {
             reapplyTint();
           }
@@ -866,8 +984,7 @@
         case 'zen.page-tint.light-average':
           YT_AMBIENT = prefBool('zen.page-tint.youtube-ambient', true);
           LIGHT_AVERAGE = prefBool('zen.page-tint.light-average', false);
-          themeCache.clear();
-          scheduleSample(true);
+          invalidateSamples();
           break;
       }
     },
@@ -878,10 +995,17 @@
   // Cleanup on window unload / mod hot-reload. Sine's addUnloadListener is
   // preferred (it survives hot-reload); fall back to a one-shot 'unload'.
   const cleanup = () => {
+    if (disposed) return;
+    disposed = true;
+    window.removeEventListener('load', onWindowLoad);
     try { gBrowser.removeProgressListener(progressListener); } catch {}
     try { gBrowser.tabContainer.removeEventListener('TabSelect', onTabSelect); } catch {}
     try { gBrowser.tabContainer.removeEventListener('TabClose', onTabClose); } catch {}
     try { glanceObserver.disconnect(); } catch {}
+    try { chromeThemeObserver.disconnect(); } catch {}
+    backdropResizeObserver?.disconnect();
+    if (ambientClipRaf) cancelAnimationFrame(ambientClipRaf);
+    ambientClipRaf = 0;
     try {
       if (colorSchemeQuery && onColorSchemeChange) colorSchemeQuery.removeEventListener('change', onColorSchemeChange);
     } catch {}
@@ -906,15 +1030,26 @@
         const browser = tab.linkedBrowser;
         if (!browser) continue;
         detachBrowser(browser);
-        sendTeardown(browser);
       }
     } catch {}
     applyTheme(null);
     root.removeAttribute('zen-page-tint-active');
     root.removeAttribute('zen-page-tint-live');
+    for (const overlay of tintBackdrops) overlay.remove();
+    tintBackdrops.length = 0;
+    windowBackdrop = null;
+    for (const name of originalStyles.keys()) restoreStyle(name);
   };
   if (typeof addUnloadListener === 'function') addUnloadListener(cleanup);
   else window.addEventListener('unload', cleanup, { once: true });
+
+  // Initialize only after all state and cleanup handlers exist.
+  root.style.setProperty('--zpt-live-smoothing-ms', `${LIVE_SMOOTH_MS}ms`);
+  applyCssVarPrefs();
+  root.setAttribute('zen-page-tint-active', 'on');
+  if (LIVE_MODE) root.setAttribute('zen-page-tint-live', 'on');
+  if (document.readyState === 'complete') onWindowLoad();
+  else window.addEventListener('load', onWindowLoad, { once: true });
 
   log('initialized');
 })();

@@ -1,4 +1,5 @@
 sync-to-zen.sh
+.DS_Store
 .scguard/
 *.profraw
 
